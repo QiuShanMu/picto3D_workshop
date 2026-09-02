@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}零售 3D 生产台{% endblock %} · 图生 3D 流水线</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand">
+      <div class="brand-mark">3D</div>
+      <div class="brand-txt">图生 3D<br><small>生产工作台</small></div>
+    </div>
+    <nav class="nav">
+      <a href="/" class="{{ 'active' if page=='board' }}"><span class="ico">▦</span>批次看板</a>
+      <a href="/capture" class="{{ 'active' if page=='capture' }}"><span class="ico">📷</span>采集台</a>
+      <a href="/generate" class="{{ 'active' if page=='generate' }}"><span class="ico">⚙️</span>3D 生成</a>
+      <a href="/validate" class="{{ 'active' if page=='validate' }}"><span class="ico">🔍</span>校验 · 矫正</a>
+      <a href="/viewer3d" class="{{ 'active' if page=='viewer3d' }}"><span class="ico">🧊</span>3D 查看</a>
+      <a href="/archive" class="{{ 'active' if page=='archive' }}"><span class="ico">🗂</span>归档</a>
+    </nav>
+    <div class="side-foot">
+      <div class="st" id="camStatus"><span class="dot"></span><span id="camTxt">相机 —</span></div>
+      <div class="ver">provider: <b id="prov">auto</b></div>
+    </div>
+  </aside>
+  <main class="content">
+    <header class="top">
+      <div class="crumb">{% block crumb %}{% endblock %}</div>
+      <div class="top-right">
+        <label class="batch-label">批次</label>
+        <input id="globalBatch" value="{{ batch|default('0812') }}" class="batch-input" title="回车切换批次">
+        <button class="btn btn-ghost" id="refreshBtn">刷新</button>
+      </div>
+    </header>
+    {% block content %}{% endblock %}
+  </main>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const qs=new URLSearchParams(location.search);
+const batchInput=$('globalBatch');
+if(qs.get('batch')) batchInput.value=qs.get('batch');
+function currentBatch(){return batchInput.value||'0812';}
+function goWithBatch(path){const b=currentBatch();window.location.href=`${path}${path.includes('?')?'&':'?'}batch=${b}`;}
+$('refreshBtn').onclick=()=>window.location.reload();
+batchInput.addEventListener('keydown',e=>{if(e.key==='Enter'){const b=batchInput.value.trim()||'0812';window.location.href=`${location.pathname}?batch=${b}`;}});
+function setCam(txt,ok){const el=$('camTxt');if(el)el.textContent=txt;const d=$('camStatus');if(d)d.className='st '+(ok?'cam-on':'cam-off');}
+fetch('/info').then(r=>r.json()).then(d=>setCam(`${d.serial} · ${d.color}`,true)).catch(()=>setCam('未连接相机',false));
+</script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

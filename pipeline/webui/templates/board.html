@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% block title %}批次看板{% endblock %}
+{% block crumb %}批次看板
+  <span class="crumb-badge" id="batchShow">0812</span>
+{% endblock %}
+{% block content %}
+<div class="body">
+  <div class="cards" id="metrics">
+    <div class="metric"><div class="n" id="mTotal">–</div><div class="l">SKU 总数</div></div>
+    <div class="metric ok"><div class="n" id="mReady">–</div><div class="l">已齐 · 可生成</div></div>
+    <div class="metric warn"><div class="n" id="mInc">–</div><div class="l">缺档 · 待补拍</div></div>
+    <div class="metric err"><div class="n" id="mNoCap">–</div><div class="l">未采集</div></div>
+    <div class="metric info"><div class="n" id="mArchive">–</div><div class="l">已归档</div></div>
+  </div>
+
+  <div class="grid" id="cards">
+    <div class="empty" style="grid-column:1/-1">
+      <div class="big">⏳</div>正在加载批次数据…
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+const STATUS_LABEL={ready:'已齐',incomplete:'缺档',no_capture:'未采集'};
+const SLOTS=['01','02','03','04','05','06','07','08'];
+const DEG={'01':'0°','02':'45°','03':'90°','04':'135°','05':'180°','06':'225°','07':'270°','08':'315°'};
+const POSE={'01':'正面','02':'45°左前','03':'90°左','04':'135°','05':'180°背','06':'225°','07':'270°右','08':'315°右前'};
+function slotTitle(i,cap,miss,req){
+  const d=DEG[i]||''; const p=POSE[i]?'·'+POSE[i]:'';
+  return `档位${i} ${d}${p}${cap?'·已拍':miss?'·缺':req?'·未拍':'·非必拍'}`;
+}
+function refresh(data){
+  const set=(id,v)=>$(id).textContent=v;
+  set('mTotal',data.total); set('mReady',data.ready); set('mInc',data.incomplete); set('mNoCap',data.no_capture);
+  set('batchShow',data.batch_id);
+  const archive=Array.from(data.skus).filter(s=>s.pipeline&&s.pipeline.archived).length;
+  set('mArchive',archive);
+  const cards=$('cards'); cards.innerHTML='';
+  if(!data.skus.length){cards.innerHTML='<div class="empty" style="grid-column:1/-1"><div class="big">📦</div>该批次暂无 SKU，请先采集或装配批次。</div>';return;}
+  data.skus.forEach(s=>{
+    const cls=s.status==='ready'?'ok':s.status==='incomplete'?'warn':'err';
+    const slotHtml=SLOTS.map(i=>{
+      const cap=s.captured_indices.includes(i);
+      const miss=s.missing_required.includes(i);
+      const req=s.required.includes(i);
+      let c='slot'+(cap?' on':req?(miss?' miss':''):'noreq');
+      return `<div class="${c}" title="${slotTitle(i,cap,miss,req)}">${i}<small>${cap?'✓':miss?'缺':(DEG[i]||'')}</small></div>`;
+    }).join('');
+    const pl=s.pipeline||{};
+    const task=(typeof _tasks!=='undefined'&&_tasks[s.sku_id])? _tasks[s.sku_id] : null;
+    const genBusy = task && (task.status==='running'||task.status==='pending');
+    const genMsg = task? `${task.message||''}` : '';
+    const modelStage = genBusy
+      ? `<span class="stage warn">模型<span class="spinner"></span></span>`
+      : `<span class="stage ${pl.model_present?'on':''}">模型${pl.model_present?'✓':'…'}</span>`;
+    const rail=`<div class="rail">
+      <span class="stage ${pl.api?'on':''}">图${pl.api?'✓':'…'}</span><span class="sep">›</span>
+      ${modelStage}<span class="sep">›</span>
+      <span class="stage ${pl.archived?'on':''}">归档${pl.archived?'✓':'…'}</span>
+    </div>`;
+    const count=Object.values(s.captured_indices).filter(x=>s.required.includes(x)).length;
+    const mainBtn = pl.model_present
+      ? `<a class="btn btn-sm" href="/validate?batch=${s.batch_id}&sku=${s.sku_id}">去校验</a>`
+      : genBusy
+          ? `<button class="btn btn-sm" disabled>${task.status==='pending'?'排队中':'🔧生成中…'}</button>`
+          : (s.status==='ready'
+              ? `<a class="btn btn-sm" href="/sku/${s.sku_id}?batch=${s.batch_id}">去生成</a>`
+              : `<a class="btn btn-sm" href="/capture?batch=${s.batch_id}&sku=${s.sku_id}">拍摄</a>`);
+    cards.innerHTML+=`<div class="card">
+      <div class="row1"><h3>${s.sku_id}</h3><span class="pill ${cls}">${STATUS_LABEL[s.status]||s.status}</span></div>
+      <div class="slots">${slotHtml}</div>
+      ${rail}
+      ${genMsg?`<div style="font-size:.72rem;color:var(--m)">${genMsg}</div>`:''}
+      <div style="font-size:.76rem;color:var(--m)">已拍 ${count}/${s.required.filter(r=>s.required.includes(r)).length} 必拍档</div>
+      <div class="actions">
+        <a class="btn btn-ghost btn-sm" href="/sku/${s.sku_id}?batch=${s.batch_id}">详情</a>
+        ${mainBtn}
+      </div>
+    </div>`;
+  });
+}
+let _tasks={};
+function refreshTasks(){
+  const b=currentBatch();
+  fetch(`/gen/status/${b}`).then(r=>r.json()).then(j=>{
+    _tasks=j.tasks||{};
+  }).catch(()=>{});
+}
+function load(){
+  const b=currentBatch();
+  fetch(`/api/batch/${b}`).then(r=>r.json()).then(refresh).catch(()=>refresh({total:0,ready:0,incomplete:0,no_capture:0,skus:[]}));
+}
+// refresh task status and board data on independent intervals (avoid mutual-recursion storm)
+setInterval(refreshTasks, 5000);
+setInterval(load, 5000);
+load();
+</script>
+{% endblock %}

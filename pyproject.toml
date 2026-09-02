@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "product-3d-pipeline"
+version = "0.1.0"
+description = "Retail multi-SKU image-to-3D pipeline modules"
+requires-python = ">=3.11"
+dependencies = [
+    "trimesh>=4.4",
+    "pillow>=10.0",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+rembg = ["rembg>=2.0"]
+capture = ["pyrealsense2>=2.55", "opencv-python>=4.8"]
+capture-web = ["pyrealsense2>=2.55", "opencv-python>=4.8", "flask>=3.0"]
+capture-barcode = ["pyzbar>=0.1.9"]
+scan = ["flask>=3.0", "pyzbar>=0.1.9", "opencv-python>=4.8", "cryptography>=42.0"]
+hunyuan = ["tencentcloud-sdk-python>=3.0.1200", "cos-python-sdk-v5>=1.9", "python-dotenv>=1.0", "requests>=2.31"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+p3d-validate = "pipeline.validate.cli:main"
+p3d-preprocess = "pipeline.preprocess.cli:main"
+p3d-capture = "pipeline.capture.cli:main"
+p3d-handoff = "pipeline.capture.handoff_cli:main"
+p3d-capture-web = "pipeline.capture.webapp:main"
+p3d-batch-assemble = "pipeline.capture.batch_cli:main"
+p3d-queue = "pipeline.queue.cli:main"
+p3d-archive = "pipeline.archive.cli:main"
+p3d-web = "pipeline.webui.__main__:main"
+p3d-scan = "pipeline.scan.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["pipeline*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,20 @@
+---
+description: 零售图生3D流水线的目录、混元接入与范围约束
+alwaysApply: true
+---
+
+# 流水线约定
+
+实现或改文档时遵守：
+
+- 生成只走腾讯云 `ai3d`：`SubmitHunyuanTo3DProJob` / `QueryHunyuanTo3DProJob`，Version `2025-05-13`。
+- 主路径 Model=`3.1`，EnablePBR=true。极速版不做主路径。
+- 正面 → `ImageUrl`；其余用 `MultiViewImages`。不要上传 `*_04`（135°）和 `*_06`（225°）。
+- API 用压缩图；原图只放 `data/incoming` 与归档。多视合计 ≤8MB。
+- `data/work/<batch>/<sku>/vN/` 每次生成一档；`current` 指向正式版。
+- 适配器接口保持 `submit / poll / download`，不要把 SDK 类型散落到校验和归档。
+- 手持扫码枪 Qp2100 是**键盘仿真（Keyboard Wedge）**：字符打进**当前焦点输入框**。SKU 前置录入走**采集台页面内 `keydown` 捕获阶段聚合**（间隔 <60ms 判同一梭、回车终结、自动填 SKU 并锁定、锁后再扫忽略）。**禁止**改成后台全局钩子（pynput）、串口或 `msvcrt` 控制台读键——那些均不可靠（字符进前台焦点窗口，后台钩子抓不到；RDP 远程键鼠占用输入通道）。
+- v1 不做外观自动评分、不做飞书、不自托管开源图生3D。
+- 先分模块闭环（预处理 / 混元落盘 / 校验 / 检查 / 归档），禁止一上来写完整 E2E 状态机和全局大配置。submit 必须与 poll/download 做在同一单元。
+
+细节以 `docs/spec-hunyuan-api.md` 和 `docs/spec-orchestration.md` 为准。

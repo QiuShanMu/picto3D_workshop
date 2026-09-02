@@ -1,0 +1,281 @@
+{% extends "base.html" %}
+{% block title %}3D 查看 · 尺寸调整{% endblock %}
+{% block crumb %}3D 查看 · 尺寸调整 <span class="chip" id="curModel">{{ sku or '' }}</span>{% endblock %}
+{% block content %}
+<div class="body">
+  <div class="v3d-grid">
+    <div class="v3d-left">
+      <div class="v3d-canvas-wrap">
+        <div id="v3d-loading" class="v3d-loading">加载模型中…</div>
+        <canvas id="v3d-canvas"></canvas>
+        <div class="v3d-hud" id="v3d-hud">—</div>
+        <div class="v3d-viewbar">
+          <button class="btn btn-ghost btn-sm" id="resetView">复位视角</button>
+          <button class="btn btn-ghost btn-sm" id="toggleWire">线框</button>
+          <button class="btn btn-ghost btn-sm" id="screenshot">截图</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="v3d-right">
+      <div class="box">
+        <h4>加载模型</h4>
+        <div class="field"><label>批次 · SKU · 版本</label>
+          <div style="display:flex;gap:8px">
+            <input id="pathBatch" value="{{ batch|default('0821') }}" placeholder="batch">
+            <input id="pathSku" value="{{ sku or 'APP-0821-001' }}" placeholder="SKU">
+            <input id="pathVer" value="v3" placeholder="版本 v1/v2…">
+          </div>
+        </div>
+        <button class="btn btn-sm" id="loadBtn">加载</button>
+      </div>
+
+      <div class="box">
+        <h4>当前尺寸</h4>
+        <div class="size-readout">
+          <div class="dim"><span>长 W</span><b id="dimW">–</b><small>mm</small></div>
+          <div class="dim"><span>高 H</span><b id="dimH">–</b><small>mm</small></div>
+          <div class="dim"><span>深 D</span><b id="dimD">–</b><small>mm</small></div>
+        </div>
+        <div class="size-meta" id="sizeMeta">面数 – · 点 –</div>
+      </div>
+
+      <div class="box" id="sizeAdjustBox">
+        <h4>尺寸调整（预览缩放）</h4>
+        <div class="cmp" id="cmpNow"><span class="lbl">当前</span><b id="cmpCur">–</b></div>
+        <div class="cmp" id="cmpTarget"><span class="lbl">目标</span><b id="cmpTar">–</b></div>
+        <div class="field"><label>目标尺寸 (mm W,H,D, 逗号分隔)</label><input id="targetMm" placeholder="例如 120,80,40" value="120,80,40"></div>
+        <div class="btn-row">
+          <button class="btn btn-sm" id="applyScale">应用预览缩放</button>
+          <button class="btn btn-ghost btn-sm" id="resetScale">复位</button>
+        </div>
+        <div class="status-line"><span class="spin" id="v3dSpin"></span><div class="status" id="scaleStatus"></div></div>
+      </div>
+
+      <div class="box">
+        <h4>导出调整后的模型</h4>
+        <p class="hint">预览确认后，用 trimesh 按目标尺寸等比缩放，输出为下一版本并写入校验报告。</p>
+        <button class="btn btn-warn btn-sm" id="exportBtn" style="width:100%">导出为下一版本</button>
+        <button class="btn btn-ghost btn-sm" id="backValidate" style="width:100%;margin-top:8px">↩ 回校验台</button>
+      </div>
+    </div>
+  </div>
+</div>
+{{ super() }}
+{% endblock %}
+{% block scripts %}
+{{ super() }}
+<script type="importmap">
+{
+  "imports": {
+    "three": "/static/vendor/three/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+const $ = id => document.getElementById(id);
+let renderer, scene, camera, controls, model = null, root = null;
+let origBox = null, appliedScale = 1;
+
+function initRenderer(){
+  const canvas = $('v3d-canvas');
+  renderer = new THREE.WebGLRenderer({canvas, antialias:true, preserveDrawingBuffer:true});
+  renderer.setPixelRatio(window.devicePixelRatio);
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0f172a);
+
+  // grid + lights
+  const grid = new THREE.GridHelper(1, 10, 0x334155, 0x1e293b);
+  scene.add(grid);
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x334155, 1.6));
+  const dir = new THREE.DirectionalLight(0xffffff, 1.4);
+  dir.position.set(1, 2, 1.5);
+  scene.add(dir);
+
+  camera = new THREE.PerspectiveCamera(50, 1, 0.001, 100);
+  camera.position.set(0.25, 0.2, 0.4);
+  camera.lookAt(0, 0, 0);
+}
+
+async function loadModel(url){
+  $('v3d-loading').style.display='flex';
+  try{
+    const { GLTFLoader } = await import('/static/vendor/three/loaders/GLTFLoader.js');
+    const loader = new GLTFLoader();
+    const gltf = await new Promise((res, rej)=>loader.load(url, res, undefined, rej));
+    if(root) scene.remove(root);
+    root = new THREE.Group();
+    model = gltf.scene;
+    root.add(model);
+    scene.add(root);
+
+    // center on origin and normalize
+    const box = new THREE.Box3().setFromObject(model);
+    const center = box.getCenter(new THREE.Vector3());
+    model.position.sub(center);
+    model.position.set(-center.x, -center.y, -center.z);
+    origBox = new THREE.Box3().setFromObject(model);
+    fitCamera();
+    updateReadout();
+    // auto-enter size-adjust preview when launched from the validate workbench
+    if(window.__autoSize){
+      const t=parseMm(window.__autoSize);
+      if(t){ $('targetMm').value=window.__autoSize; $('applyScale').click(); }
+      window.__autoSize=null;
+    }
+    $('v3d-loading').style.display='none';
+  }catch(e){
+    $('v3d-loading').style.display='none';
+    $('v3d-hud').textContent = '加载失败: ' + (e.message||e);
+  }
+}
+
+function fitCamera(){
+  const box = new THREE.Box3().setFromObject(root);
+  const size = box.getSize(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  const fov = camera.fov * Math.PI/180;
+  const dist = (maxDim/2) / Math.tan(fov/2) * 2.2;
+  camera.position.set(dist*0.7, dist*0.6, dist*0.9);
+  camera.near = maxDim/2000; camera.far = maxDim*100;
+  camera.updateProjectionMatrix();
+  camera.lookAt(0,0,0);
+}
+
+function currentSizeMm(){
+  const box = new THREE.Box3().setFromObject(model);
+  const s = box.getSize(new THREE.Vector3());
+  return [s.x*1000, s.y*1000, s.z*1000];
+}
+function fmt(a){ return a.map(x=>x.toFixed(1)).join(' × ') + ' mm'; }
+function updateReadout(){
+  if(!model) return;
+  const [wx,wy,wz]=currentSizeMm();
+  $('dimW').textContent = wx.toFixed(1);
+  $('dimH').textContent = wy.toFixed(1);
+  $('dimD').textContent = wz.toFixed(1);
+  let faces=0, verts=0;
+  model.traverse(o=>{ if(o.isMesh){ const g=o.geometry; verts+=g.attributes.position.count; if(g.index) faces+=g.index.count/3; else faces+=g.attributes.position.count/3; }});
+  $('sizeMeta').textContent = `面数 ${faces} · 点 ${verts}`;
+  $('v3d-hud').textContent = fmt(currentSizeMm());
+  // update current-vs-target comparison
+  $('cmpCur').textContent = fmt(currentSizeMm());
+  const targ=parseMm($('targetMm').value);
+  $('cmpTar').textContent = targ ? fmt(targ) : '—';
+}
+function setScale(m,c){ const el=$('scaleStatus'); el.textContent=m; el.className='status '+(c||''); }
+
+function resize(){
+  const wrap = $('v3d-canvas').parentElement;
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w/h; camera.updateProjectionMatrix();
+}
+
+// events
+$('loadBtn').onclick = ()=>{
+  const b=$('pathBatch').value, s=$('pathSku').value, v=$('pathVer').value;
+  loadModel(`/api/glb/${b}/${s}/${v}`);
+};
+$('resetView').onclick=()=>{ resetScaleLocal(); fitCamera(); };
+$('toggleWire').onclick=()=>{
+  model && model.traverse(o=>{ if(o.isMesh){ o.material.wireframe=!o.material.wireframe; }});
+};
+$('screenshot').onclick=()=>{
+  const url = renderer.domElement.toDataURL('image/png');
+  const a=document.createElement('a'); a.href=url; a.download='model_view.png'; a.click();
+};
+$('applyScale').onclick=()=>{
+  if(!model){ setScale('先加载模型','err'); return; }
+  const target=parseMm($('targetMm').value); if(!target){ setScale('尺寸格式不对 (W,H,D)','err'); return; }
+  // match backend: scale so the LARGEST current dim reaches the LARGEST target (proportional)
+  const cur=currentSizeMm(); const scaleFactor=Math.max(...target)/Math.max(...cur);
+  model.scale.setScalar(scaleFactor);
+  appliedScale=scaleFactor;
+  const after=currentSizeMm();
+  updateReadout();
+  setScale(`已等比缩放 (×${scaleFactor.toFixed(3)}) → 预览 ${fmt(after)}，目标 ${fmt(target)}`,'ok');
+};
+$('resetScale').onclick=()=>{ resetScaleLocal(); };
+function resetScaleLocal(){ if(model){ model.scale.setScalar(1); } appliedScale=1; updateReadout(); }
+function parseMm(s){ const a=(s||'').split(/[,，xX×]/).filter(Boolean).map(Number); return (a.length===3 && a.every(n=>isFinite(n)&&n>0))?a:null; }
+$('targetMm').addEventListener('input',()=>{
+  if(model) updateReadout();
+});
+$('backValidate').onclick=()=>{
+  const b=$('pathBatch').value, s=$('pathSku').value;
+  window.location.href=`/validate?batch=${b}&sku=${s}`;
+};
+
+$('exportBtn').onclick=async()=>{
+  const target=parseMm($('targetMm').value); if(!target){ alert('先给目标尺寸 (W,H,D mm)'); return; }
+  if(!confirm(`导出下一版本，目标 ${target.join(',')}mm？`)) return;
+  const b=$('pathBatch').value, s=$('pathSku').value, v=$('pathVer').value;
+  $('v3dSpin').classList.add('show');
+  try{
+    const r=await fetch('/size/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({batch:b,sku:s,version:v,size_mm:target})});
+    const j=await r.json();
+    if(j.ok){
+      alert('✓ 已导出 '+j.new_version+' · '+j.real_bbox_mm.join('×')+'mm');
+      $('pathVer').value=j.new_version;
+      loadModel(`/api/glb/${b}/${s}/${j.new_version}`);
+    } else alert('导出失败：'+(j.error||'未知'));
+  } finally { $('v3dSpin').classList.remove('show'); }
+};
+
+// controls (import OrbitControls as module)
+async function setupControls(){
+  const { OrbitControls } = await import('/static/vendor/three/controls/OrbitControls.js');
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping=true; controls.dampingFactor=0.08;
+  controls.minDistance=0.005; controls.maxDistance=50;
+  renderer.setAnimationLoop(()=>{ controls.update(); renderer.render(scene,camera); });
+}
+
+initRenderer();
+resize();
+window.addEventListener('resize', resize);
+setupControls();
+const INIT_BATCH='{{ batch }}', INIT_SKU='{{ sku or "APP-0821-001" }}';
+$('pathBatch').value=INIT_BATCH; $('pathSku').value=INIT_SKU;
+// URL-driven integration: ?ver=&mode=size&size=W,H,D  (jump from validate for size-correct)
+const q=new URLSearchParams(location.search);
+const verQ=q.get('ver')||'v3';
+const sizeQ=q.get('size');
+const modeQ=q.get('mode');
+$('pathVer').value=verQ;
+if(sizeQ){ $('targetMm').value=sizeQ; }
+if(modeQ==='size'){
+  document.querySelector('#sizeAdjustBox').classList.add('size-active');
+  // auto-apply preview scale once the model loads
+  window.__autoSize=sizeQ;
+}
+loadModel(`/api/glb/${INIT_BATCH}/${INIT_SKU}/${verQ}`);
+</script>
+<style>
+.v3d-grid{display:grid;grid-template-columns:1.9fr 1fr;gap:18px}
+.v3d-canvas-wrap{position:relative;background:#0b1220;border:1px solid var(--line);border-radius:var(--r);overflow:hidden;box-shadow:var(--shadow);aspect-ratio:16/10}
+#v3d-canvas{width:100%;height:100%;display:block}
+.v3d-loading{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--m);background:rgba(11,18,32,.7);z-index:5}
+.v3d-hud{position:absolute;top:12px;left:12px;background:rgba(0,0,0,.55);color:#fff;padding:5px 11px;border-radius:8px;font-size:.75rem;font-family:ui-monospace,monospace;backdrop-filter:blur(4px)}
+.v3d-viewbar{position:absolute;top:12px;right:12px;display:flex;gap:6px}
+.size-readout{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px}
+.dim{background:var(--panel2);border:1px solid var(--line2);border-radius:9px;padding:10px;text-align:center}
+.dim span{font-size:.66rem;color:var(--m);display:block}
+.dim b{font-size:1.2rem;font-weight:800}
+.dim small{color:var(--m);font-size:.7rem}
+.size-meta{font-size:.74rem;color:var(--m);margin-bottom:14px}
+.btn-row{display:flex;gap:8px;margin-bottom:10px}
+.hint{font-size:.78rem;color:var(--m);line-height:1.5;margin:0 0 10px}
+#sizeAdjustBox.size-active{border-color:var(--a);box-shadow:0 0 0 3px rgba(59,130,246,.15);position:relative}
+#sizeAdjustBox.size-active::after{content:'调整模式';position:absolute;top:-9px;right:12px;background:var(--a);color:#fff;font-size:.64rem;padding:2px 8px;border-radius:10px}
+.cmp{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:9px;background:var(--panel2);border:1px solid var(--line2);margin-bottom:8px}
+.cmp .lbl{font-size:.68rem;color:var(--m);width:32px}
+.cmp b{font-size:.9rem;font-family:ui-monospace,monospace}
+#cmpTarget b{color:var(--a)}
+@media (max-width:1080px){.v3d-grid{grid-template-columns:1fr}}
+</style>
+{{ super() }}
+{% endblock %}

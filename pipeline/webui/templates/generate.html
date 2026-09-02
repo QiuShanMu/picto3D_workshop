@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}3D 生成{% endblock %}
+{% block crumb %}3D 生成工作台 <span class="chip" id="genBatch">{{ batch|default('0812') }}</span>{% endblock %}
+{% block content %}
+<div class="body">
+  <div class="cards">
+    <div class="metric info"><div class="n" id="gBuildable">–</div><div class="l">可生成 SKU</div></div>
+    <div class="metric ok"><div class="n" id="gBuilt">–</div><div class="l">已生成</div></div>
+    <div class="metric warn"><div class="n" id="gPending">–</div><div class="l">待处理</div></div>
+    <div class="metric"><div class="n" id="gVersions">–</div><div class="l">累计版本</div></div>
+  </div>
+
+  <div class="sect-head">
+    <div><h2>生成队列</h2><div class="sub">对「已齐」的 SKU 提交混元生 3D；未配真密钥时用 mock 跑通全链。</div></div>
+    <div class="toolbar" style="margin:0">
+      <button class="btn btn-soft btn-sm" id="refresh" onclick="load()">刷新</button>
+      <button class="btn btn-sm" id="buildSelected">⚙️ 生成选中</button>
+    </div>
+  </div>
+
+  <div class="grid" id="genCards">
+    <div class="empty" style="grid-column:1/-1"><div class="big">⏳</div>加载中…</div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+function render(data){
+  const skus=data.skus;
+  const buildable=skus.filter(s=>s.buildable).length;
+  const built=skus.filter(s=>s.model_present).length;
+  const pending=skus.filter(s=>s.buildable&&!s.model_present).length;
+  const vers=skus.reduce((a,s)=>a+s.versions.length,0);
+  $('gBuildable').textContent=buildable;
+  $('gBuilt').textContent=built;
+  $('gPending').textContent=pending;
+  $('gVersions').textContent=vers;
+  $('genBatch').textContent=data.batch_id;
+  const c=$('genCards'); c.innerHTML='';
+  if(!skus.length){c.innerHTML='<div class="empty" style="grid-column:1/-1"><div class="big">🚫</div>该批次没有可生成的 SKU（需先采集全档位并预处理）。</div>';return;}
+  skus.forEach(s=>{
+    const task=s.task||{};
+    const taskTxt=task.status?`<span class="chip ${task.status==='done'?'on':task.status==='fail'?'':'warn'}">${task.status==='running'?'🔧生成中':task.status==='pending'?'排队中':task.status==='done'?'✓完成':task.status==='fail'?'✕失败':task.status}</span>`:'';
+    const vlist=(s.versions||[]).map(v=>`
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px dashed var(--line)">
+        <span class="mono">${v.version}</span>
+        <span class="chip ${v.status==='done'?'on':''}">${v.status==='done'?'✓ done':v.status||'–'}</span>
+        <span class="mono" style="font-size:.74rem">${v.real_bytes? (v.real_bytes/1024).toFixed(0)+'KB':'—'}</span>
+        <span class="verdict ${v.validate_verdict||'unvalidated'}">${v.validate_verdict||'未校验'}</span>
+      </div>`).join('')||'<div style="padding:8px 0;color:var(--m);font-size:.8rem">尚未生成版本</div>';
+    c.innerHTML+=`<div class="card">
+      <div class="row1"><h3>${s.sku_id}</h3><label class="chk"><input type="checkbox" class="sel" value="${s.sku_id}" ${s.buildable?'':'disabled'}></label></div>
+      <div style="font-size:.74rem;color:var(--m)">${s.buildable?'已就绪 · 可生成':'未就绪（需采集+预处理）'}</div>
+      ${taskTxt?`<div style="margin:6px 0 0">${taskTxt} <span style="font-size:.72rem;color:var(--m)">${task.message||''}</span></div>`:''}
+      <div>${vlist}</div>
+      <div class="actions">
+        ${s.model_present?`<a class="btn btn-ghost btn-sm" href="/validate?batch=${s.batch_id}&sku=${s.sku_id}">去校验</a>`:''}
+        <a class="btn btn-soft btn-sm" href="/validate?batch=${s.batch_id}&sku=${s.sku_id}">查看</a>
+      </div>
+    </div>`;
+  });
+}
+function load(){
+  const b=currentBatch();
+  fetch(`/api/gen/${b}`).then(r=>r.json()).then(render).catch(e=>{const c=$('genCards');c.innerHTML='<div class="empty" style="grid-column:1/-1">加载失败</div>';});
+}
+function selectedSkus(){
+  return Array.from(document.querySelectorAll('.sel:checked')).map(x=>x.value);
+}
+$('buildSelected').onclick=async()=>{
+  const sel=selectedSkus(); const b=currentBatch();
+  if(!sel.length){alert('请先勾选要生成的 SKU');return;}
+  if(!confirm(`确认对批次 ${b} 的 ${sel.length} 个 SKU 提交混元生 3D？`))return;
+  const btn=$('buildSelected'); btn.disabled=true; btn.textContent='生成中…';
+  try{
+    const r=await fetch('/gen/build',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({batch:b,skus:sel})});
+    const j=await r.json();
+    toast(j.message,j.errors?'err':'ok');
+    load();
+  }catch(e){toast('提交失败:'+e,'err');}
+  btn.disabled=false; btn.textContent='⚙️ 生成选中';
+};
+function toast(m,c){const t=document.createElement('div');t.className='toast '+(c||'')+' show';t.textContent=m;document.body.appendChild(t);setTimeout(()=>t.remove(),3200);}
+load();
+</script>
+{% endblock %}

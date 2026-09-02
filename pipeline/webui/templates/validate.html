@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block title %}校验 · 矫正{% endblock %}
+{% block crumb %}3D 校验 · 尺寸矫正{% endblock %}
+{% block content %}
+<div class="body">
+  <div class="cards">
+    <div class="metric"><div class="n" id="vTotal">–</div><div class="l">模型总数</div></div>
+    <div class="metric ok"><div class="n" id="vOk">–</div><div class="l">校验通过</div></div>
+    <div class="metric warn"><div class="n" id="vWarn">–</div><div class="l">需关注</div></div>
+    <div class="metric err"><div class="n" id="vFail">–</div><div class="l">校验失败</div></div>
+    <div class="metric info"><div class="n" id="vScaled">–</div><div class="l">已尺寸矫正</div></div>
+  </div>
+
+  <div class="sect-head">
+    <div><h2>生成模型清单</h2><div class="sub">每条含校验 verdict 与尺寸偏差；偏差超标可一键按目标尺寸矫正。</div></div>
+    <div class="toolbar" style="margin:0">
+      <button class="btn btn-ghost btn-sm" onclick="load()">刷新</button>
+    </div>
+  </div>
+
+  <table class="table">
+    <thead><tr>
+      <th>SKU</th><th>版本</th><th>校验</th><th class="right">大小</th>
+      <th class="right">面数</th><th class="right">流形率</th><th class="right">包围盒(mm)</th>
+      <th class="right">尺寸偏差</th><th>操作</th>
+    </tr></thead>
+    <tbody id="vRows"><tr><td colspan="9" style="text-align:center;color:var(--m);padding:30px">加载中…</td></tr>    </tbody>
+  </table>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+function render(data){
+  const items=data.items;
+  const ok=items.filter(i=>i.verdict==='ok').length;
+  const fail=items.filter(i=>i.verdict==='fail').length;
+  const warn=items.filter(i=>i.verdict==='warn').length;
+  const scaled=items.filter(i=>i.scale_deviation!==undefined&&i.scale_deviation!==null&&i.scale_deviation<0.10).length;
+  $('vTotal').textContent=items.length; $('vOk').textContent=ok; $('vWarn').textContent=warn; $('vFail').textContent=fail;
+  $('vScaled').textContent=scaled;
+  const tb=$('vRows'); tb.innerHTML='';
+  if(!items.length){tb.innerHTML='<tr><td colspan="9" style="text-align:center;color:var(--m);padding:30px">该批次暂无已生成模型，请先在「3D 生成」里提交。</td></tr>';return;}
+  items.forEach(i=>{
+    const vcls=i.verdict==='ok'?'ok':i.verdict==='warn'?'warn':i.verdict==='fail'?'fail':'unvalidated';
+    const dev=i.scale_deviation;
+    const devCss=dev===undefined||dev===null?'—':(dev<0.10?'ok':dev<0.20?'warn':'fail');
+    const devTxt=dev===undefined||dev===null?'—':(dev*100).toFixed(2)+'%';
+    const bbox=i.bbox?i.bbox.map(x=>Math.round(x*1000)).map(x=>String(x)).join(' × '):'—';
+    // default target for size-correct = current bbox in mm (so user just tweaks from a sane baseline)
+    const defMm=i.bbox? i.bbox.map(x=>Math.round(x*1000*10)/10).join(',') : '120,80,40';
+    const sizeUrl=`/viewer3d?batch=${i.batch_id}&sku=${i.sku_id}&ver=${i.version}&size=${defMm}&mode=size`;
+    tb.innerHTML+=`<tr>
+      <td><b>${i.sku_id}</b><span class="chip ${i.archived?'on':''}" style="margin-left:6px">${i.archived?'已归档':''}</span></td>
+      <td class="mono">${i.version}</td>
+      <td><span class="verdict ${vcls}">${i.verdict==='unvalidated'?'未校验':i.verdict.toUpperCase()}</span></td>
+      <td class="right mono">${i.size_bytes? (i.size_bytes/1024).toFixed(0)+'KB':'—'}</td>
+      <td class="right mono">${i.faces!==undefined?i.faces:'—'}</td>
+      <td class="right mono">${i.manifold_ratio!==undefined?(i.manifold_ratio*100).toFixed(1)+'%':'—'}</td>
+      <td class="right mono">${bbox}</td>
+      <td class="right"><span class="verdict ${devCss}">${devTxt}</span></td>
+      <td>
+        <div style="display:flex;gap:6px">
+          <a class="btn btn-ghost btn-sm" href="/viewer3d?batch=${i.batch_id}&sku=${i.sku_id}&ver=${i.version}">查看3D</a>
+          <button class="btn btn-ghost btn-sm" onclick="openDetail('${i.sku_id}','${i.batch_id}','${i.version}')">详情</button>
+          ${i.model_exists?`<a class="btn btn-soft btn-sm" href="${sizeUrl}">尺寸矫正</a>`:''}
+          ${i.model_exists&&!i.archived?`<button class="btn btn-soft btn-sm" onclick="doArchive('${i.sku_id}','${i.batch_id}','${i.version}')">归档</button>`:''}
+          ${i.model_exists&&!i.archived?`<button class="btn btn-ghost btn-sm" onclick="doRerun(this,'${i.sku_id}','${i.batch_id}')">重新生成</button>`:''}
+        </div>
+      </td>
+    </tr>`;
+  });
+}
+function load(){
+  const b=currentBatch();
+  fetch(`/api/validate/${b}`).then(r=>r.json()).then(render).catch(e=>{$('vRows').innerHTML='<tr><td colspan="9" style="text-align:center;color:var(--err);padding:30px">加载失败</td></tr>';});
+}
+async function doArchive(sku,batch,version){
+  if(!confirm(`确认归档 SKU ${sku} · ${version} 到归档目录？`))return;
+  try{
+    const r=await fetch('/archive/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,batch,version})});
+    const j=await r.json();
+    alert(j.message+(j.archive_dir?('\n'+j.archive_dir):'')); load();
+  }catch(e){alert('归档失败:'+e);}
+}
+async function doRerun(btn,sku,batch){
+  if(!confirm(`确认对 SKU ${sku} 重新生成（新版本 vN）？`))return;
+  btn.disabled=true; btn.textContent='生成中…';
+  try{
+    const r=await fetch('/gen/rerun',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,batch})});
+    const j=await r.json();
+    alert(j.message||'已受理，后台生成中…');
+    load();
+  }catch(e){alert('重新生成失败:'+e);}
+  btn.disabled=false; btn.textContent='重新生成';
+}
+function openDetail(sku,batch,ver){
+  document.body.insertAdjacentHTML('beforeend',`<div class="modal-mask" id="m${ver}"><div class="modal"><div class="modal-head"><b>${sku} · ${ver} 校验详情</b><button class="x" onclick="this.closest('.modal-mask').remove()">×</button></div><div class="modal-body" id="md${ver}">加载中…</div></div></div>`);
+  fetch(`/api/validate/${batch}/${sku}/${ver}`).then(r=>r.json()).then(d=>{
+    const checks=(d.checks||[]).map(c=>`<tr><td>${c.id}</td><td>${c.ok?'<span class="verdict ok">通过</span>':'<span class="verdict fail">未过</span>'}</td><td>${c.detail||''}</td></tr>`).join('')||'<tr><td colspan="3">无检查项</td></tr>';
+    $(`md${ver}`).innerHTML=`<table class="table"><thead><tr><th>检查</th><th>结果</th><th>说明</th></tr></thead><tbody>${checks}</tbody></table>`;
+  });
+}
+load();
+</script>
+<style>
+.modal-mask{position:fixed;inset:0;background:rgba(15,23,42,.5);display:flex;align-items:center;justify-content:center;z-index:200}
+.modal{background:#fff;border-radius:14px;width:680px;max-width:92vw;max-height:82vh;overflow:auto;box-shadow:var(--shadow-lg)}
+.modal-head{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--line);font-size:.94rem}
+.modal-head .x{background:none;border:0;font-size:1.3rem;cursor:pointer;color:var(--m)}
+.modal-body{padding:16px 18px}
+</style>
+{% endblock %}

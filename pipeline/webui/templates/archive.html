@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}归档{% endblock %}
+{% block crumb %}归档目录{% endblock %}
+{% block content %}
+<div class="body">
+  <div class="cards">
+    <div class="metric ok"><div class="n" id="aTotal">–</div><div class="l">归档 SKU</div></div>
+    <div class="metric info"><div class="n" id="aModels">–</div><div class="l">模型文件</div></div>
+  </div>
+  <div class="sect-head"><div><h2>已归档资产</h2><div class="sub">data/archive/&lt;category&gt;/&lt;batch&gt;/&lt;sku&gt;/ 下的正式资产。</div></div>
+    <div class="toolbar" style="margin:0"><button class="btn btn-ghost btn-sm" onclick="load()">刷新</button></div></div>
+  <table class="table">
+    <thead><tr><th>分类</th><th>批次</th><th>SKU</th><th class="right">模型大小</th><th>操作</th></tr></thead>
+    <tbody id="aRows"><tr><td colspan="5" style="text-align:center;color:var(--m);padding:30px">加载中…</td></tr>    </tbody>
+  </table>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+function load(){
+  fetch('/api/archive').then(r=>r.json()).then(d=>{
+    $('aTotal').textContent=d.total; $('aModels').textContent=d.models;
+    const tb=$('aRows'); tb.innerHTML='';
+    if(!d.items.length){tb.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--m);padding:30px">暂无归档资产，请在「校验·矫正」通过后执行归档。</td></tr>';return;}
+    d.items.forEach(i=>{tb.innerHTML+=`<tr><td>${i.category}</td><td>${i.batch_id}</td><td><b>${i.sku_id}</b></td><td class="right mono">${(i.size/1024).toFixed(0)}KB</td><td><a class="btn btn-ghost btn-sm" href="/validate?batch=${i.batch_id}&sku=${i.sku_id}">查看</a></td></tr>`;});
+  });
+}
+load();
+</script>
+{% endblock %}

@@ -1,0 +1,249 @@
+{% extends "base.html" %}
+{% block title %}SKU 详情 · {{ sku }}{% endblock %}
+{% block crumb %}SKU 详情 <span class="chip" id="ddSku">{{ sku }}</span>{% endblock %}
+{% block content %}
+<div class="body">
+  <div class="cards" id="ddMetrics">
+    <div class="metric"><div class="n" id="mViews">–</div><div class="l">已拍档位</div></div>
+    <div class="metric ok"><div class="n" id="mStatus">–</div><div class="l">采集状态</div></div>
+    <div class="metric info"><div class="n" id="mVers">–</div><div class="l">生成版本</div></div>
+    <div class="metric warn"><div class="n" id="mVerdict">–</div><div class="l">校验结论</div></div>
+    <div class="metric"><div class="n" id="mArch">–</div><div class="l">归档</div></div>
+  </div>
+
+  <div class="sect-head">
+    <div><h2>拍摄图片</h2><div class="sub">点击缩略图查看大图；仅展示实际采集到的视角。</div></div>
+    <div class="toolbar" style="margin:0">
+      <a class="btn btn-ghost btn-sm" id="lnkBack" href="/">← 回看板</a>
+    </div>
+  </div>
+
+  <div class="viewer">
+    <div class="viewer-main">
+      <img id="bigImg" alt="点击下方缩略图查看">
+      <div class="viewer-badge" id="bigBadge">尚未选择</div>
+    </div>
+    <div class="thumb-grid" id="thumbs"></div>
+  </div>
+
+  <div class="sect-head">
+    <div><h2>视角清单</h2><div class="sub">各视角的拍摄/缺省状态与混元槽位。</div></div>
+  </div>
+  <table class="table">
+    <thead><tr><th>档位</th><th>朝向</th><th>角度</th><th>混元槽</th><th>状态</th></tr></thead>
+    <tbody id="viewRows"></tbody>
+  </table>
+
+  <div class="sect-head">
+    <div><h2>生成与校验</h2><div class="sub">图审通过后点击「提交生成」；模型会在后台自动下载、自动校验，无需手动拉取。</div></div>
+    <div class="toolbar" style="margin:0" id="ddActions"></div>
+  </div>
+
+  <div class="box" id="genBar" style="margin-bottom:14px;display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap">
+    <div class="field" style="flex:1;min-width:180px">
+      <label>目标尺寸 size_mm（长,宽,高）</label>
+      <input id="sizeMm" placeholder="如 120,80,40" value="120,80,40">
+    </div>
+    <div class="field" style="flex:1;min-width:160px">
+      <label>生成状态</label>
+      <div id="genStatus" class="chip" style="font-size:.8rem">—</div>
+    </div>
+    <div class="field" style="min-width:0">
+      <button class="btn" id="submitGen" disabled>⚙️ 提交生成</button>
+    </div>
+  </div>
+
+  <table class="table">
+    <thead><tr><th>版本</th><th>模型</th><th>生成状态</th><th>校验</th><th>尺寸</th><th>操作</th></tr></thead>
+    <tbody id="verRows"></tbody>
+  </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const DEG={'01':'0°','02':'45°','03':'90°','04':'135°','05':'180°','06':'225°','07':'270°','08':'315°'};
+const batch="{{ batch|default('0812') }}";
+const sku="{{ sku }}";
+let selected='';
+
+function fmtDev(dev){
+  if(dev===undefined||dev===null)return '—';
+  const cls=dev<0.10?'ok':dev<0.20?'warn':'fail';
+  return `<span class="verdict ${cls}">${(dev*100).toFixed(2)}%</span>`;
+}
+function render(d){
+  $('ddSku').textContent=d.sku_id;
+  const views=d.views||[];
+  const cap=views.filter(v=>v.captured).length;
+  $('mViews').textContent=`${cap}/${views.length}`;
+  const st=d.status;
+  const stCls=st==='ready'?'ok':st==='incomplete'?'warn':'err';
+  $('mStatus').textContent=(st==='ready'?'已齐':st==='incomplete'?'缺档':'未采集');
+  $('mStatus').parentElement.className='metric '+stCls;
+  const pl=d.pipeline||{};
+  $('mVers').textContent=(pl.versions||[]).length;
+  const lastVerdict=(pl.versions&&pl.versions.length)?pl.versions[pl.versions.length-1].validate_verdict:'unvalidated';
+  $('mVerdict').textContent=lastVerdict==='unvalidated'?'未校验':lastVerdict.toUpperCase();
+  $('mVerdict').parentElement.className='metric '+(lastVerdict==='ok'?'ok':lastVerdict==='fail'?'err':lastVerdict==='warn'?'warn':'');
+  $('mArch').textContent=pl.archived?'已归档':'未归档';
+  $('mArch').parentElement.className='metric '+(pl.archived?'ok':'');
+
+  // thumbnails + big image
+  const t=$('thumbs'); t.innerHTML='';
+  const captured = views.filter(v=>v.captured);
+  if(!captured.length){ t.innerHTML='<div class="thumb empty" style="grid-column:1/-1">暂无采集图片，请先到采集台拍摄。</div>'; $('bigImg').removeAttribute('src'); $('bigImg').style.display='none'; $('bigBadge').textContent='暂无图片'; }
+  captured.forEach(v=>{
+    const cls=v.index===selected?'thumb on':'thumb';
+    const deg=DEG[v.index]||'';
+    t.innerHTML+=`<div class="${cls}" data-idx="${v.index}" data-url="${v.url}" title="档位${v.index} ${v.pose||''} ${deg}">
+        <span class="thumb-no">${v.index} <small>${deg}</small></span>
+        <img src="${v.url}" loading="lazy" alt="${v.index}">
+      </div>`;
+    if(!selected) selected=v.index;
+  });
+  if(selected){
+    const curViews=views.find(v=>v.index===selected);
+    const curT=t.querySelector(`.thumb[data-idx="${selected}"]`);
+    if(curT){
+      const url=curT.dataset.url;
+      const img=$('bigImg');
+      img.src=url; img.style.display='block';
+      const deg=DEG[curViews.index]||'';
+      $('bigBadge').textContent=`档位 ${curViews.index} · ${curViews.pose||''} ${deg}`;
+    }
+  }
+  t.querySelectorAll('.thumb[data-url]').forEach(el=>el.onclick=()=>{
+    selected=el.dataset.idx;
+    t.querySelectorAll('.thumb').forEach(x=>x.classList.remove('on'));
+    el.classList.add('on');
+    const img=$('bigImg'); img.src=el.dataset.url; img.style.display='block';
+    const v=views.find(x=>x.index===selected);
+    const deg=DEG[v.index]||'';
+    $('bigBadge').textContent=`档位 ${v.index} · ${v.pose||''} ${deg}`;
+  });
+
+  // view rows
+  const vr=$('viewRows'); vr.innerHTML='';
+  views.forEach(v=>{
+    const stTxt=v.captured?'<span class="verdict ok">已拍</span>':(v.hunyuan?'<span class="verdict warn">缺</span>':'<span class="verdict unvalidated">非必拍</span>');
+    vr.innerHTML+=`<tr><td class="mono">${v.index}</td><td>${v.pose||''}</td><td class="mono">${v.degrees>=0?v.degrees+'°':'—'}</td><td class="mono">${v.hunyuan||'—'}</td><td>${stTxt}</td></tr>`;
+  });
+
+  // versions
+  const b=$('verRows'); b.innerHTML='';
+  const versions=pl.versions||[];
+  if(!versions.length){ b.innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--m);padding:30px">尚未生成版本，图审通过后点击「提交生成」。</td></tr>'; }
+  versions.forEach(v=>{
+    const vcls=v.validate_verdict==='ok'?'ok':v.validate_verdict==='fail'?'fail':v.validate_verdict==='warn'?'warn':'unvalidated';
+    const m=(v.metrics||{});
+    const bbox=m.bbox?m.bbox.map(x=>Math.round(x*1000)).join(' × '):'—';
+    b.innerHTML+=`<tr><td class="mono">${v.version}</td>
+      <td>${v.has_model?'<span class="verdict ok">✓</span>':'<span class="verdict unvalidated">—</span>'}</td>
+      <td class="mono">${v.status||'—'}</td>
+      <td><span class="verdict ${vcls}">${v.validate_verdict==='unvalidated'?'未校验':(v.validate_verdict||'—').toUpperCase()}</span></td>
+      <td class="mono">${bbox}</td>
+      <td>${v.has_model?`<a class="btn btn-ghost btn-sm" href="/viewer3d?batch=${batch}&sku=${sku}&ver=${v.version}">查看</a>`:''}</td></tr>`;
+  });
+
+  // generate bar state
+  const genBtn=$('submitGen'); const genSt=$('genStatus');
+  const modelPresent=pl.model_present;
+  genBtn.disabled = modelPresent;   // once a model exists, prefer re-run via validate
+  if(modelPresent){
+    genBtn.textContent='已生成';
+    genSt.textContent='已有模型 · 可去校验/矫正或重新生成';
+    genSt.className='chip on';
+  } else {
+    genBtn.textContent='⚙️ 提交生成';
+    genSt.textContent='待提交';
+    genSt.className='chip';
+  }
+
+  // actions
+  const a=$('ddActions'); a.innerHTML='';
+  if(pl.archived){
+    a.innerHTML=`<span class="chip on">已归档</span> <a class="btn btn-soft btn-sm" href="/archive">归档目录</a>`;
+  } else {
+    const parts=[];
+    parts.push(`<a class="btn btn-ghost btn-sm" href="/capture?batch=${batch}&sku=${sku}">采集</a>`);
+    if(modelPresent){
+      parts.push(`<a class="btn btn-soft btn-sm" href="/validate?batch=${batch}&sku=${sku}">校验·矫正</a>`);
+      const latest=(pl.versions&&pl.versions.length)?pl.versions[pl.versions.length-1].version:'';
+      parts.push(`<button class="btn btn-soft btn-sm" onclick="doArchive('${latest}')">归档</button>`);
+      parts.push(`<button class="btn btn-ghost btn-sm" onclick="doRerun()">重新生成</button>`);
+    }
+    a.innerHTML=parts.join(' ');
+  }
+}
+async function doArchive(version){
+  if(!confirm(`确认归档 SKU ${sku} · ${version||'最新'} 到归档目录？`))return;
+  try{
+    const r=await fetch('/archive/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,batch,version:version||''})});
+    const j=await r.json();
+    alert(j.message+(j.archive_dir?('\n'+j.archive_dir):'')); load();
+  }catch(e){alert('归档失败:'+e);}
+}
+async function doRerun(){
+  if(!confirm(`确认对 SKU ${sku} 重新生成（新版本 vN）？`))return;
+  try{
+    const r=await fetch('/gen/rerun',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,batch})});
+    const j=await r.json();
+    const st=$('genStatus'); st.textContent=j.message||'已受理，后台生成中…'; st.className='chip '+(j.ok?'':'err');
+    startPoll(); setTimeout(load, 2500);
+  }catch(e){alert('重新生成失败:'+e);}
+}
+async function submitGenerate(){
+  const sizeMm=$('sizeMm').value.trim();
+  const btn=$('submitGen'); btn.disabled=true; btn.textContent='提交中…';
+  try{
+    const r=await fetch('/gen/build',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({batch,skus:[sku],size_mm:sizeMm||null})});
+    const j=await r.json();
+    const st=$('genStatus');
+    st.textContent=j.message||'已受理，后台生成中…';
+    st.className='chip '+(j.ok?'':'err');
+    startPoll();
+  }catch(e){ const st=$('genStatus'); st.textContent='提交失败:'+e; st.className='chip err'; }
+  btn.disabled=false; btn.textContent='⚙️ 提交生成';
+  // refresh after a moment to pick up new version
+  setTimeout(load, 2500);
+}
+let pollTimer=null;
+function startPoll(){
+  if(pollTimer) clearInterval(pollTimer);
+  pollTimer=setInterval(async()=>{
+    try{
+      const r=await fetch(`/gen/status/${batch}`); const j=await r.json();
+      const t=(j.tasks||{})[sku];
+      if(!t){ return; }
+      const st=$('genStatus');
+      const label={'running':'🔧 生成中','done':'✅ 完成','fail':'❌ 失败','pending':'排队中','error':'异常'}[t.status]||t.status;
+      st.textContent=`${label} ${t.version?('('+t.version+')'):''} ${t.message||''}`;
+      st.className='chip '+(t.status==='done'?'on':t.status==='fail'?'err':'warn');
+      if(t.status==='done'||t.status==='fail'){ clearInterval(pollTimer); pollTimer=null; load(); }
+    }catch(e){ /* ignore transient */ }
+  },2000);
+}
+function load(){
+  fetch(`/api/sku-detail/${batch}/${sku}`)
+    .then(r=>r.json()).then(render)
+    .catch(e=>{ $('thumbs').innerHTML='<div class="thumb empty" style="grid-column:1/-1">加载失败：'+e+'</div>'; });
+}
+$('lnkBack').href=`/?batch=${batch}`;
+$('submitGen').onclick=submitGenerate;
+load();
+</script>
+<style>
+.viewer{display:grid;grid-template-columns:1fr;gap:16px}
+.viewer-main{position:relative;border-radius:var(--r);overflow:hidden;background:#0b1220;min-height:420px;display:flex;align-items:center;justify-content:center;box-shadow:var(--shadow)}
+.viewer-main img{max-width:100%;max-height:520px;object-fit:contain}
+.viewer-badge{position:absolute;top:12px;left:12px;background:rgba(0,0,0,.6);color:#fff;padding:6px 12px;border-radius:8px;font-size:.82rem;font-weight:600}
+.thumb-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(128px,1fr));gap:10px}
+.thumb{position:relative;border-radius:10px;overflow:hidden;background:var(--panel2);border:1px solid var(--line2);cursor:pointer;aspect-ratio:4/3}
+.thumb img{width:100%;height:100%;object-fit:cover}
+.thumb .thumb-no{position:absolute;top:6px;left:6px;background:rgba(0,0,0,.55);color:#fff;padding:2px 8px;border-radius:6px;font-size:.72rem;font-weight:700;z-index:2}
+.thumb .thumb-no small{font-weight:500;opacity:.85}
+.thumb.on{border-color:var(--info);box-shadow:0 0 0 2px var(--info)}
+.thumb.empty{display:flex;align-items:center;justify-content:center;color:var(--m);font-size:.85rem;aspect-ratio:unset;min-height:120px;cursor:default}
+</style>
+{% endblock %}
