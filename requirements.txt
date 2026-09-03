@@ -1,0 +1,37 @@
+# 零售多SKU图生3D流水线依赖清单（一键安装，等价于 pyproject.toml 的核心 + 常用 optional 组）
+# 说明：
+#   - 基础依赖（必装）：trimesh / pillow / numpy
+#   - 相机拍摄（capture / capture-web）：pyrealsense2 / opencv-python / flask
+#   - 扫码（scan / capture-barcode）：pyzbar / cryptography / flask / opencv
+#   - 混元接入（hunyuan）：tencentcloud-sdk-python / cos-python-sdk-v5 / python-dotenv / requests
+#   - dev（测试）：pytest
+#   - 若不需要相机/扫码，可删掉 [[capture]] / [[scan]] 两组；rembg 未接线，按需启用
+
+# ---- 基础 ----
+trimesh>=4.4
+pillow>=10.0
+numpy>=1.26
+
+# ---- 相机拍摄（无相机可删） ----
+pyrealsense2>=2.55
+opencv-python>=4.8
+
+# ---- 采集页面 / 生产 WebUI ----
+flask>=3.0
+# 注意：WebUI 只需 flask + 上述基础；相机预览才需要 pyrealsense2
+
+# ---- 扫码（可选） ----
+pyzbar>=0.1.9
+cryptography>=42.0
+
+# ---- 混元接入 ----
+tencentcloud-sdk-python>=3.0.1200
+cos-python-sdk-v5>=1.9
+python-dotenv>=1.0
+requests>=2.31
+
+# ---- 开发/测试 ----
+pytest>=8.0
+
+# ---- 可选：去背景（rembg 预留，未接线） ----
+# rembg>=2.0

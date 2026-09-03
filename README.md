@@ -24,6 +24,9 @@
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+# 方式一：一键安装全部依赖（核心 + 相机 + 扫码 + 混元 + 测试，等价于下面各 .[..] extra 加总）
+pip install -r requirements.txt
+# 方式二：按需分组安装（更精简，按你的工位/链路勾选）
 pip install -e ".[dev]"
 pip install -e ".[capture]"        # 拍摄工位才需要 pyrealsense2 / opencv
 pip install -e ".[capture-web]"    # 采集页面才需要 flask（含 pyrealsense2）
