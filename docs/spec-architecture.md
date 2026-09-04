@@ -14,6 +14,8 @@ download(files) -> local_paths
 
 后处理接口（补纹理、转格式）同样走适配器，v1 可以只实现 `submit/poll/download`。
 
+混元输出约 50 万面 / 4K 贴图，如需低面数或轻量化资产，**不在接口用 `FaceCount`/`LowPoly` 降面**（均加价），改对已下载模型做后处理减面。技术选型与一手验证见 [spec-optimize.md](./spec-optimize.md)。
+
 ## 2. 模块
 
 ```
