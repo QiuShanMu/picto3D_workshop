@@ -31,7 +31,7 @@
       <span class="badge">D435I · <span id="serial">…</span> · <span id="res">…</span></span>
       <div class="gate">
         <span>清晰度<b id="gSharp">–</b></span>
-        <span>过曝<b id="gExp">–</b></span>
+        <span>明暗剪切<b id="gExp">–</b></span>
         <span>主体占比<b id="gRatio">–</b></span>
       </div>
     </div>
@@ -60,6 +60,25 @@
         <div class="status" id="bcStatus">先拍一张条码图，识别后自动填入 SKU；识别失败可手动输入</div>
       </div>
       <div class="box">
+        <h4>曝光与亮度</h4>
+        <div class="field">
+          <label>EV 补偿 <b id="evValue">+0.0</b></label>
+          <input id="evControl" type="range" min="-3" max="3" step="0.1" value="0" style="width:100%">
+        </div>
+        <div class="bcrow">
+          <label class="chip" style="display:flex;align-items:center;gap:6px;cursor:pointer">
+            <input id="autoExposure" type="checkbox"> 自动曝光
+          </label>
+          <div class="field" style="width:105px;margin:0">
+            <label>增益</label>
+            <input id="gainControl" type="number" min="0" step="1" value="64">
+          </div>
+          <button class="btn btn-soft btn-sm" id="applyExposure" type="button">应用曝光</button>
+        </div>
+        <div class="hint" id="exposureActual">正在读取相机参数…</div>
+        <div class="status" id="brightnessHint">正在分析画面亮度…</div>
+      </div>
+      <div class="box">
         <h4>② 视角采集</h4>
         <div class="field"><label>档位</label><select id="index"></select></div>
         <div class="field"><label>批次</label><input id="batch" value="{{ batch|default('0812') }}"></div>
@@ -84,7 +103,10 @@
   <img id="lbImg" alt="已拍图片">
   <div class="cap" id="lbCap"></div>
   <div class="cd" id="lbCd"></div>
-  <button class="btn btn-sm" id="lbReshoot" style="margin-top:4px">↩ 回采集·重拍这档</button>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:4px">
+    <button class="btn btn-sm" id="lbReshoot">↩ 回采集·重拍这档</button>
+    <button class="btn btn-danger btn-sm" id="lbDelete">删除此图</button>
+  </div>
   <span class="nav next" id="lbNext">›</span>
 </div>
 {% endblock %}
@@ -95,10 +117,11 @@ const SLOTS=['01','02','03','04','05','06','07','08'];
 const DEG={'01':'0°','02':'45°','03':'90°','04':'135°','05':'180°','06':'225°','07':'270°','08':'315°'};
 const POSE={'01':'正面','02':'45°左前','03':'90°左','04':'135°','05':'180°背','06':'225°','07':'270°右','08':'315°右前'};
 function slotLabel(s){return `${s} ${DEG[s]||''}`.trim()+(POSE[s]?` · ${POSE[s]}`:'');}
-let cur='01';
+let cur={{ start_index|default('01')|tojson }};
 let capturedSet=new Set();   // 已采集档位集合，用于高亮
 const sel=$('index');
 SLOTS.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=`${s} · ${DEG[s]||''}`;sel.appendChild(o);});
+sel.value=cur;
 function drawSlots(){
   $('slots').innerHTML=SLOTS.map(s=>{
     const done=capturedSet.has(s);
@@ -152,6 +175,30 @@ $('lbReshoot').onclick=()=>{
   closeLightbox();
   setStatus(`已选中档位 ${s.index}（${s.pose||''}），确认姿态后点「📷 采集当前档」补拍`,'');
 };
+$('lbDelete').onclick=async()=>{
+  const s=shots[lbIdx]; if(!s) return;
+  const sku=($('skuLocked').value||$('sku').value).trim();
+  const batch=$('batch').value.trim();
+  if(!confirm(`确认删除 SKU ${sku} 的档位 ${s.index} 图片？\n删除后该档会变为“缺”，可立即重拍。`)) return;
+  const btn=$('lbDelete'); btn.disabled=true; btn.textContent='删除中…';
+  try{
+    const r=await fetch('/capture/frame/delete',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({batch,sku,index:s.index})
+    });
+    const j=await r.json();
+    if(!r.ok||!j.ok) throw new Error(j.error||'删除失败');
+    cur=s.index; sel.value=cur;
+    capturedSet.delete(s.index); drawSlots();
+    closeLightbox(); loadCapturedShots(); loadBatchSkus();
+    setStatus(`${j.message}${j.warning?' '+j.warning:''}`,'warn');
+  }catch(e){
+    setStatus('删除失败：'+e.message,'err');
+  }finally{
+    btn.disabled=false; btn.textContent='删除此图';
+  }
+};
 function closeLightbox(){ $('lb').classList.remove('show'); }
 $('lbX').onclick=closeLightbox;
 $('lb').onclick=(e)=>{ if(e.target===$('lb')) closeLightbox(); };
@@ -167,6 +214,87 @@ sel.onchange=()=>{cur=sel.value;drawSlots();};
 drawSlots();
 function setStatus(m,c){const s=$('status');s.textContent=m;s.className='status '+(c||'');}
 function setSkuLocked(v){$('skuLocked').value=v||$('sku').value;}
+
+// ---- live exposure / quality advisory ----
+let exposureInitialized=false;
+function updateExposureDisabled(){
+  const auto=$('autoExposure').checked;
+  $('evControl').disabled=auto;
+  $('gainControl').disabled=auto;
+}
+function renderCameraStatus(data){
+  const q=data.quality||{};
+  const controls=data.controls||{};
+  if(!exposureInitialized && controls.exposure!==undefined){
+    $('autoExposure').checked=!!controls.auto_exposure;
+    $('evControl').value=Number(data.ev||0).toFixed(1);
+    $('gainControl').value=Math.round(controls.gain||0);
+    exposureInitialized=true;
+    updateExposureDisabled();
+  }
+  $('evValue').textContent=(Number($('evControl').value)>=0?'+':'')+Number($('evControl').value).toFixed(1);
+  if(controls.exposure!==undefined){
+    $('exposureActual').textContent=`当前曝光 ${Math.round(controls.exposure)} · 增益 ${Math.round(controls.gain||0)}${controls.auto_exposure?' · 自动':''}`;
+  }
+  if(q.sharpness!==undefined) $('gSharp').textContent=Number(q.sharpness).toFixed(1);
+  if(q.exposure!==undefined) $('gExp').textContent=(Number(q.exposure)*100).toFixed(1)+'%';
+  if(q.object_ratio!==undefined) $('gRatio').textContent=(Number(q.object_ratio)*100).toFixed(1)+'%';
+  const hint=$('brightnessHint');
+  if(q.brightness_status==='too_bright'){
+    hint.className='status warn';
+    hint.textContent=`画面过亮：高光剪切 ${(q.overexposure*100).toFixed(1)}%，请降低 EV`;
+  }else if(q.brightness_status==='too_dark'){
+    hint.className='status warn';
+    hint.textContent=`画面过暗：暗部剪切 ${(q.underexposure*100).toFixed(1)}%，请提高 EV`;
+  }else if(q.brightness_status==='mixed_clipping'){
+    hint.className='status warn';
+    hint.textContent=`明暗同时剪切 ${(q.exposure*100).toFixed(1)}%，建议调整 EV 或布光`;
+  }else if(q.brightness_status){
+    hint.className='status ok';
+    hint.textContent=`亮度正常 · 平均亮度 ${Number(q.brightness||0).toFixed(0)}/255`;
+  }
+  if(q.object_ok===false){
+    hint.className='status warn';
+    hint.textContent+=`；主体占比 ${(q.object_ratio*100).toFixed(1)}% 仅提醒，不阻止采集`;
+  }
+}
+async function loadCameraStatus(){
+  try{
+    const r=await fetch('/camera/status');
+    if(r.ok) renderCameraStatus(await r.json());
+  }catch(e){ /* transient camera restart */ }
+}
+$('evControl').oninput=()=>{
+  const value=Number($('evControl').value);
+  $('evValue').textContent=(value>=0?'+':'')+value.toFixed(1);
+};
+$('autoExposure').onchange=updateExposureDisabled;
+$('applyExposure').onclick=async()=>{
+  const btn=$('applyExposure'); btn.disabled=true; btn.textContent='应用中…';
+  try{
+    const r=await fetch('/camera/exposure',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        ev:Number($('evControl').value),
+        gain:Number($('gainControl').value),
+        auto_exposure:$('autoExposure').checked
+      })
+    });
+    const j=await r.json();
+    if(!r.ok||!j.ok) throw new Error(j.error||'设置失败');
+    exposureInitialized=false;
+    renderCameraStatus({ev:j.ev,controls:j.controls,quality:{}});
+    setStatus(j.message,'ok');
+    setTimeout(loadCameraStatus,500);
+  }catch(e){
+    setStatus('曝光设置失败：'+e.message,'err');
+  }finally{
+    btn.disabled=false; btn.textContent='应用曝光';
+  }
+};
+setInterval(loadCameraStatus,1000);
+loadCameraStatus();
 
 // ---- ① 下一个 SKU / 新建 SKU ----
 // status priority: incomplete, no_capture first; ready last (already done)
@@ -201,6 +329,7 @@ function applyCaptured(v){
 }
 function resetSku(v){
   bcLocked=false;
+  skuInputSource='手动录入';
   $('sku').value=v||''; $('sku').disabled=false;
   $('skuLocked').value=''; $('skuLocked').placeholder='待扫码或键入 SKU';
   $('lockSku').textContent='锁定'; $('lockSku').disabled=!($('sku').value.trim());
@@ -217,17 +346,25 @@ $('nextSku').onclick=()=>{
   if(selVal){ resetSku(selVal); }
   else {
     // auto-pick the next queue item with highest priority
-    const cand=skuQueue.find(s=>s.status!=='ready') || skuQueue[0];
+    const cand=skuQueue.find(s=>s.status==='no_capture') || skuQueue.find(s=>s.status!=='ready');
     if(cand) resetSku(cand.sku_id);
     else setStatus('本批次没有可采集的 SKU（请先建批次或在看板添加）','warn');
   }
 };
 $('freshSku').onclick=()=>{ resetSku(''); $('sku').focus(); };
-$('nextSel').onchange=()=>{ resetSku($('nextSel').value); };
+$('nextSel').onchange=()=>{
+  const v=$('nextSel').value;
+  resetSku(v);
+  const obj=skuQueue.find(s=>s.sku_id===v);
+  if(obj && obj.status!=='no_capture' && (obj.captured_indices||[]).length){
+    doLock(v, '已有');
+  }
+};
 $('batch').onchange=()=>{ loadBatchSkus(); };
 
 // ---- ① SKU 条码采集 ----
 let bcLocked=false;
+let skuInputSource='手动录入';
 function bcInfo(mode,text){
   const el=$('bcInfo');el.textContent=text;el.className='chip '+(mode||'');
 }
@@ -238,6 +375,9 @@ $('readBc').onclick=async()=>{
     const r=await fetch('/barcode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({batch:$('batch').value,sku:$('sku').value,manual:false})});
     const j=await r.json();
     if(j.ok && j.value){
+      const info=await lookupSkuShot(j.value);
+      if(info.already){ refuseReshoot(info, '读条码'); return; }
+      skuInputSource='图像识码';
       $('sku').value=j.value; setSkuLocked(j.value);
       bcInfo('ok', j.value + ' · ' + (j.type||'?') + ' / ' + (j.source||'?'));
       $('bcStatus').className='status ok';$('bcStatus').textContent='识别成功，已自动填入 SKU，请核对后点「锁定」';
@@ -260,8 +400,39 @@ $('readBc').onclick=async()=>{
   $('readBc').disabled=false;
 };
 // keep the "locked SKU" readout in sync as the user types
-$('sku').oninput=()=>{ if(!bcLocked){ setSkuLocked($('sku').value); $('lockSku').disabled = !($('sku').value.trim()); } };
-function doLock(v, source){
+$('sku').oninput=()=>{
+  if(!bcLocked){
+    skuInputSource='手动录入';
+    setSkuLocked($('sku').value);
+    $('lockSku').disabled = !($('sku').value.trim());
+  }
+};
+async function lookupSkuShot(v){
+  const batch=$('batch').value.trim();
+  try{
+    const r=await fetch(`/api/sku/${batch}/${encodeURIComponent(v)}`);
+    const j=await r.json();
+    const n=j.captured_count || (j.captured_indices||[]).length || 0;
+    return {already: !!(j.already_captured || n>0), count:n, status:j.status||'no_capture', sku:v};
+  }catch(e){
+    return {already:false, count:0, status:'unknown', sku:v};
+  }
+}
+function refuseReshoot(info, source){
+  const n=info.count||0;
+  const st=info.status==='ready'?'已齐档':'已拍 '+n+' 档';
+  const msg=`此 SKU 已拍摄（${st}），请勿二次采集。请换下一件。`;
+  bcInfo('warn', info.sku+' · 已拍摄');
+  $('bcStatus').className='status warn';
+  $('bcStatus').innerHTML=msg+' <a href="/sku/'+encodeURIComponent(info.sku)+'?batch='+encodeURIComponent($('batch').value)+'">查看详情</a>';
+  setStatus(msg,'warn');
+  $('sku').value='';
+  setSkuLocked('');
+  $('lockSku').disabled=true;
+  $('sku').disabled=false;
+  $('sku').focus();
+}
+async function doLock(v, source){
   v=(v||'').trim();
   if(!v){$('bcStatus').className='status warn';$('bcStatus').textContent='SKU 不能为空，请先扫码或输入';return;}
   if(bcLocked){
@@ -271,13 +442,35 @@ function doLock(v, source){
     $('bcStatus').textContent='SKU 已锁定为 '+$('skuLocked').value+'，如需更换请先「➕ 新建 SKU」再扫';
     return;
   }
+  const fromBoard = source==='已有';
+  if(!fromBoard){
+    const info=await lookupSkuShot(v);
+    if(info.already){ refuseReshoot(info, source); return; }
+    try{
+      const r=await fetch('/sku/register',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({batch:$('batch').value.trim(),sku:v,source:source||skuInputSource})
+      });
+      const j=await r.json();
+      if(!r.ok || !j.ok){
+        $('bcStatus').className='status err';
+        $('bcStatus').textContent='SKU 录入时间保存失败：'+(j.error||'未知错误');
+        return;
+      }
+    }catch(e){
+      $('bcStatus').className='status err';
+      $('bcStatus').textContent='SKU 录入时间保存失败：'+e;
+      return;
+    }
+  }
   setSkuLocked(v); bcLocked=true; $('sku').value=v; $('sku').disabled=true; $('skuLocked').value=v;
   $('lockSku').textContent='已锁定'; $('lockSku').disabled=true; $('readBc').disabled=true;
   bcInfo('ok', v + (source ? ' · ' + source : ''));
   $('bcStatus').className='status ok';$('bcStatus').textContent='SKU 已锁定为 '+v+'，可开始视角采集';
   setStatus('SKU 已锁定，可开始视角采集','ok');
 }
-$('lockSku').onclick=()=>doLock($('sku').value);
+$('lockSku').onclick=()=>doLock($('sku').value, skuInputSource);
 
 // ---- USB 扫码枪（Qp2100，键盘仿真模式）：采集台页面内快速击键聚合 ----
 const SCAN_GAP_MS = 60;   // 相邻字符最大间隔：小于此值视为同一梭
@@ -340,9 +533,10 @@ $('shoot').onclick=async()=>{
       capturedSet.add(j.index);
       drawSlots();
       loadCapturedShots();   // 刷新已拍图片回看区（新拍档立即出现）
-      setStatus(`✓ 已存档位 ${j.index} · ${j.relative}（清晰 ${j.gate.sharpness.toFixed(0)} / 过曝 ${(j.gate.exposure*100).toFixed(1)}% / 占 ${(j.gate.object_ratio*100).toFixed(0)}%）`,'ok');
+      const saved=`✓ 已存档位 ${j.index} · ${j.relative}（清晰 ${j.gate.sharpness.toFixed(0)} / 剪切 ${(j.gate.exposure*100).toFixed(1)}% / 占 ${(j.gate.object_ratio*100).toFixed(0)}%）`;
+      setStatus(j.quality_ok?saved:`${saved} · 质量提醒：${j.warning||j.gate.reason||'请人工检查'}`,j.quality_ok?'ok':'warn');
     } else {
-      setStatus('✕ 门闩拒绝：'+(j.reason||j.error||'未知')+'（清晰/过曝/占比未达标）','err');
+      setStatus('采集失败：'+(j.reason||j.error||'未知错误'),'err');
     }
   }catch(e){setStatus('请求失败：'+e,'err');}
   $('shoot').disabled=false; $('spin').classList.remove('show');

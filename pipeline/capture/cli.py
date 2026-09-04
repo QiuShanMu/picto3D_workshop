@@ -34,6 +34,17 @@ def main(argv: list[str] | None = None) -> int:
         help="capture a reference frame, build the shading LUT and save it (then exit; no SKU capture)",
     )
     parser.add_argument(
+        "--shading-anchor",
+        choices=["center", "white"],
+        default="center",
+        help="shading LUT target: center=match central hue (default); white=treat the desk as true white",
+    )
+    parser.add_argument(
+        "--flatten-luma",
+        action="store_true",
+        help="also even out brightness in the shading LUT (white-desk / uneven lights)",
+    )
+    parser.add_argument(
         "--with-barcode",
         action="store_true",
         help="ask to shoot an SKU barcode at session start (archived, not fed to image-to-3D)",
@@ -98,12 +109,25 @@ def _calibrate_shading_cli(args) -> int:
         info = cam._read_info(cam._profile.get_device())
         serial = info.serial
     ref = np.mean(frames, axis=0).astype(np.uint8)
-    lut = calibrate_shading(ref, tiles=16)
+    lut = calibrate_shading(
+        ref,
+        tiles=24,
+        min_gain=0.65,
+        max_gain=1.45,
+        anchor=args.shading_anchor,
+        flatten_luma=args.flatten_luma,
+    )
     out_dir = args.capture_root / run.SHADING_DIR
     out_path = out_dir / f"{serial}_shading.json"
-    lut.save(out_path)
+    lut.save(out_path, extra={
+        "serial": serial,
+        "anchor": args.shading_anchor,
+        "flatten_luma": bool(args.flatten_luma),
+        "white_balance": int(args.wb),
+    })
     print(f"Saved shading LUT: {out_path}")
-    print(f"  serial={serial} grid={lut.grid.shape} tiles={lut.tiles}")
+    print(f"  serial={serial} grid={lut.grid.shape} tiles={lut.tiles} "
+          f"anchor={args.shading_anchor} flatten_luma={bool(args.flatten_luma)}")
     return 0
 
 

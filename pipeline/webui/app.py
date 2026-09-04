@@ -43,7 +43,12 @@ def create_app(
     @app.route("/capture")
     def capture_page():
         sku = request.args.get("sku", "")
-        return render_template("capture.html", page="capture", batch=batch, sku=sku)
+        start_index = request.args.get("index", "01")
+        if start_index not in {f"{n:02d}" for n in range(1, 11)}:
+            start_index = "01"
+        return render_template(
+            "capture.html", page="capture", batch=batch, sku=sku, start_index=start_index,
+        )
 
     @app.route("/generate")
     def generate_page():
@@ -161,6 +166,25 @@ def create_app(
     def gen_status(batch_id: str):
         return jsonify(actions.get_generate_status(batch_id))
 
+    @app.route("/sku/size", methods=["POST"])
+    def sku_size_save():
+        payload = request.get_json(silent=True) or {}
+        result = actions.save_size_mm(
+            payload.get("sku", ""), payload.get("batch", batch),
+            payload.get("size_mm", ""),
+        )
+        return jsonify(result), 200 if result.get("ok") else 400
+
+    @app.route("/capture/frame/delete", methods=["POST"])
+    def capture_frame_delete():
+        payload = request.get_json(silent=True) or {}
+        result = actions.delete_capture_frame(
+            payload.get("sku", ""),
+            payload.get("batch", batch),
+            payload.get("index", ""),
+        )
+        return jsonify(result), 200 if result.get("ok") else 400
+
     @app.route("/size/correct", methods=["POST"])
     @app.route("/size/apply", methods=["POST"])
     def size_correct():
@@ -205,6 +229,16 @@ def create_app(
         def info():
             return jsonify({"serial": worker.serial, "color": worker.color})
 
+        @app.route("/camera/status")
+        def camera_status():
+            return jsonify(worker.status())
+
+        @app.route("/camera/exposure", methods=["POST"])
+        def camera_exposure():
+            payload = request.get_json(silent=True) or {}
+            result = worker.request_exposure(payload)
+            return jsonify(result), 200 if result.get("ok") else 400
+
         @app.route("/capture", methods=["POST"])
         def capture():
             payload = request.get_json(silent=True) or {}
@@ -215,6 +249,21 @@ def create_app(
         def barcode():
             payload = request.get_json(silent=True) or {}
             result = worker.request_barcode_capture(payload)
+            return jsonify(result), 200 if result.get("ok") else 400
+
+        @app.route("/sku/register", methods=["POST"])
+        def sku_register():
+            payload = request.get_json(silent=True) or {}
+            result = worker.register_sku(
+                payload.get("batch", batch),
+                payload.get("sku", ""),
+                payload.get("source", ""),
+            )
+            return jsonify(result), 200 if result.get("ok") else 400
+
+        @app.route("/shading/calibrate", methods=["POST"])
+        def shading_calibrate():
+            result = worker.recalibrate_from_live()
             return jsonify(result), 200 if result.get("ok") else 400
 
     return app

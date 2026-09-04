@@ -56,6 +56,49 @@ def test_calibrate_reduces_radial_cast():
     )
 
 
+def test_calibrate_white_anchor_kills_global_magenta():
+    """White-desk scene: whole frame is magenta; center-anchor would keep it."""
+    h, w = 240, 320
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    img[:, :, 0] = 180  # B
+    img[:, :, 1] = 140  # G
+    img[:, :, 2] = 170  # R  (R/G=1.21, B/G=1.29)
+    # slight extra magenta toward the right edge
+    xx = np.linspace(0, 1, w, dtype=np.float32)
+    img[:, :, 2] = np.clip(img[:, :, 2].astype(np.float32) + 20 * xx, 0, 255).astype(np.uint8)
+
+    center_lut = calibrate_shading(img, tiles=8, anchor="center")
+    white_lut = calibrate_shading(img, tiles=8, anchor="white")
+    after_center = center_lut.apply(img).astype(np.float32)
+    after_white = white_lut.apply(img).astype(np.float32)
+
+    def rg_bg(arr: np.ndarray) -> tuple[float, float]:
+        g = float(arr[:, :, 1].mean())
+        return float(arr[:, :, 2].mean() / g), float(arr[:, :, 0].mean() / g)
+
+    rg_c, bg_c = rg_bg(after_center)
+    rg_w, bg_w = rg_bg(after_white)
+    assert abs(rg_c - 170 / 140) < 0.08, "center-anchor should preserve global magenta"
+    assert abs(rg_w - 1.0) < 0.06 and abs(bg_w - 1.0) < 0.06, (
+        f"white-anchor should neutralize: R/G={rg_w:.3f} B/G={bg_w:.3f}"
+    )
+
+
+def test_vertical_grid_kills_bottom_magenta_fringe():
+    """Thin purple strip at the bottom is averaged away by coarse tiles alone."""
+    h, w = 320, 240
+    img = np.full((h, w, 3), 140, dtype=np.uint8)
+    img[-16:] = (190, 140, 185)  # B,G,R magenta fringe
+    lut = calibrate_shading(img, tiles=16, anchor="white")
+    assert lut.v_grid is not None
+    out = lut.apply(img).astype(np.float32)
+    fringe = out[-12:]
+    g = float(fringe[:, :, 1].mean())
+    rg = float(fringe[:, :, 2].mean() / g)
+    bg = float(fringe[:, :, 0].mean() / g)
+    assert abs(rg - 1.0) < 0.10 and abs(bg - 1.0) < 0.10, f"fringe still tinted R/G={rg:.3f} B/G={bg:.3f}"
+
+
 def test_shading_lut_roundtrip(tmp_path):
     ref = _make_reference()
     lut = calibrate_shading(ref, tiles=8)

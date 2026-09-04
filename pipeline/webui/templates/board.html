@@ -26,6 +26,15 @@ const STATUS_LABEL={ready:'已齐',incomplete:'缺档',no_capture:'未采集'};
 const SLOTS=['01','02','03','04','05','06','07','08'];
 const DEG={'01':'0°','02':'45°','03':'90°','04':'135°','05':'180°','06':'225°','07':'270°','08':'315°'};
 const POSE={'01':'正面','02':'45°左前','03':'90°左','04':'135°','05':'180°背','06':'225°','07':'270°右','08':'315°右前'};
+function formatRegisteredAt(raw){
+  if(!raw) return '—';
+  const d=new Date(raw);
+  if(Number.isNaN(d.getTime())) return raw;
+  return d.toLocaleString('zh-CN',{
+    month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',
+    hour12:false
+  });
+}
 function slotTitle(i,cap,miss,req){
   const d=DEG[i]||''; const p=POSE[i]?'·'+POSE[i]:'';
   return `档位${i} ${d}${p}${cap?'·已拍':miss?'·缺':req?'·未拍':'·非必拍'}`;
@@ -72,6 +81,7 @@ function refresh(data){
       <div class="slots">${slotHtml}</div>
       ${rail}
       ${genMsg?`<div style="font-size:.72rem;color:var(--m)">${genMsg}</div>`:''}
+      <div style="font-size:.76rem;color:var(--m)" title="${s.registered_at_source||''}">录入 ${formatRegisteredAt(s.registered_at)}</div>
       <div style="font-size:.76rem;color:var(--m)">已拍 ${count}/${s.required.filter(r=>s.required.includes(r)).length} 必拍档</div>
       <div class="actions">
         <a class="btn btn-ghost btn-sm" href="/sku/${s.sku_id}?batch=${s.batch_id}">详情</a>

@@ -26,6 +26,7 @@ from pipeline.capture.barcode import decode_barcode
 from pipeline.capture.camera import ColorControls, D435iCamera
 from pipeline.capture.gate import gate_frame
 from pipeline.capture.run import _atomic_write_bgr, _load_shading_lut, _long_edge_resize, OUTPUT_EDGE, JPEG_QUALITY, SHADING_DIR
+from pipeline.capture.shading import calibrate_shading
 
 DEFAULT_CAPTURE_ROOT = "data/captures"
 
@@ -149,6 +150,35 @@ class WebOptions:
     max_object_ratio: float = 0.98
 
 
+def _gate_payload(gate) -> dict:
+    warnings = []
+    if not gate.sharp_ok:
+        warnings.append(f"清晰度偏低（{gate.sharpness:.1f}）")
+    if gate.brightness_status == "too_bright":
+        warnings.append(f"画面过亮（高光剪切 {gate.overexposure:.1%}），建议降低 EV")
+    elif gate.brightness_status == "too_dark":
+        warnings.append(f"画面过暗（暗部剪切 {gate.underexposure:.1%}），建议提高 EV")
+    elif gate.brightness_status == "mixed_clipping":
+        warnings.append(f"明暗同时剪切 {gate.exposure:.1%}，建议调整布光或 EV")
+    if not gate.object_ok:
+        warnings.append(f"主体占比 {gate.object_ratio:.1%} 不在建议范围内")
+    return {
+        "ok": gate.ok,
+        "sharpness": gate.sharpness,
+        "sharp_ok": gate.sharp_ok,
+        "exposure": gate.exposure,
+        "exposure_ok": gate.exposure_ok,
+        "underexposure": gate.underexposure,
+        "overexposure": gate.overexposure,
+        "brightness": gate.brightness,
+        "brightness_status": gate.brightness_status,
+        "object_ratio": gate.object_ratio,
+        "object_ok": gate.object_ok,
+        "reason": gate.reason,
+        "warnings": warnings,
+    }
+
+
 class CameraWorker:
     """Background thread that owns the pipeline: serves preview & captures."""
 
@@ -166,6 +196,14 @@ class CameraWorker:
         self._barcode_req: dict | None = None
         self._barcode_done = threading.Event()
         self._barcode_result: dict | None = None
+        self._control_req: dict | None = None
+        self._control_done = threading.Event()
+        self._control_result: dict | None = None
+        self.latest_quality: dict = {}
+        self.camera_controls: dict = {}
+        self._base_exposure = 1.0
+        self._ev = 0.0
+        self._frame_count = 0
         self._device = None
 
     def start(self) -> None:
@@ -178,6 +216,7 @@ class CameraWorker:
             self._thread.join(timeout=5)
 
     def request_capture(self, payload: dict) -> dict:
+        self._capture_result = None
         self._capture_req = payload
         self._capture_done.clear()
         # Wait (max ~3s) for the worker to capture the next frame.
@@ -189,11 +228,147 @@ class CameraWorker:
         """Grab the current frame, decode the SKU barcode, archive it, return the
         recognition result. The barcode image is stored outside the `frames` list
         so it never flows into the image-to-3D input."""
+        self._barcode_result = None
         self._barcode_req = payload
         self._barcode_done.clear()
         self._barcode_done.wait(timeout=3.0)
         result = self._barcode_result or {"ok": False, "error": "barcode capture timeout"}
         return result
+
+    def request_exposure(self, payload: dict) -> dict:
+        self._control_result = None
+        self._control_req = payload
+        self._control_done.clear()
+        self._control_done.wait(timeout=3.0)
+        return self._control_result or {"ok": False, "error": "曝光参数设置超时"}
+
+    def status(self) -> dict:
+        return {
+            "serial": self.serial,
+            "color": self.color,
+            "ev": self._ev,
+            "controls": dict(self.camera_controls),
+            "quality": dict(self.latest_quality),
+        }
+
+    def _apply_exposure_request(self, cam: D435iCamera, payload: dict) -> dict:
+        try:
+            auto = bool(payload.get("auto_exposure", False))
+            ev = float(payload.get("ev", self._ev))
+            ev = min(3.0, max(-3.0, ev))
+            gain = payload.get("gain")
+            gain = None if gain in (None, "") else float(gain)
+            exposure = None if auto else self._base_exposure * (2.0 ** ev)
+            controls = cam.set_exposure_controls(
+                auto_exposure=auto,
+                exposure=exposure,
+                gain=gain,
+            )
+            self._ev = 0.0 if auto else ev
+            self.camera_controls = controls
+            self.opts.exposure = int(round(controls["exposure"]))
+            self.opts.gain = int(round(controls["gain"]))
+            return {
+                "ok": True,
+                "ev": self._ev,
+                "controls": controls,
+                "message": (
+                    "已启用自动曝光"
+                    if auto
+                    else f"已应用 EV {self._ev:+.1f}，曝光 {controls['exposure']:.0f}，增益 {controls['gain']:.0f}"
+                ),
+            }
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": f"曝光参数无效: {exc}"}
+        except Exception as exc:
+            return {"ok": False, "error": f"相机曝光设置失败: {exc}"}
+
+    def register_sku(self, batch: str, sku: str, source: str = "") -> dict:
+        """Persist the first barcode/input time without overwriting it later."""
+        batch = str(batch or self.opts.batch_id).strip()
+        sku = str(sku or "").strip()
+        if not batch or not sku:
+            return {"ok": False, "error": "缺少 batch / sku"}
+        if (
+            batch in {".", ".."} or sku in {".", ".."}
+            or Path(batch).name != batch or Path(sku).name != sku
+            or "/" in batch or "\\" in batch or "/" in sku or "\\" in sku
+        ):
+            return {"ok": False, "error": "batch / sku 包含非法路径字符"}
+
+        capture_dir = Path(self.opts.capture_root) / batch / sku
+        cap_path = capture_dir / "capture.json"
+        if cap_path.exists():
+            try:
+                cap = json.loads(cap_path.read_text(encoding="utf-8"))
+            except Exception:
+                cap = {}
+        else:
+            cap = {}
+
+        created = not bool(cap.get("registered_at"))
+        registered_at = cap.get("registered_at") or _now_iso()
+        cap.setdefault("schema", "capture.v1")
+        cap.setdefault("sku_id", sku)
+        cap.setdefault("batch_id", batch)
+        cap.setdefault("station_id", "d435i-desk-1")
+        cap.setdefault("operator", "")
+        cap.setdefault("started_at", registered_at)
+        cap.setdefault("pose_mode", "yaw_manual_marks")
+        cap.setdefault("rotation", {"method": "manual_marks", "step_deg": 45, "direction": "ccw"})
+        cap.setdefault("camera", {
+            "model": "RealSense D435I",
+            "serial": self.serial,
+            "color": self.color,
+            "tilt_deg": 25,
+            "color_controls": {
+                "white_balance": self.opts.wb,
+                "exposure": self.opts.exposure,
+                "gain": self.opts.gain,
+                "auto_white_balance": False,
+                "auto_exposure": False,
+            },
+        })
+        cap.setdefault("frames", [])
+        cap.setdefault("status", "captured")
+        cap["registered_at"] = registered_at
+        if created:
+            cap["registration_source"] = source or "manual"
+        _write_json(cap_path, cap)
+        return {
+            "ok": True,
+            "registered_at": registered_at,
+            "registration_source": cap.get("registration_source", ""),
+            "created": created,
+        }
+
+    def recalibrate_from_live(self, n: int = 8) -> dict:
+        """Build a new shading LUT from live RAW frames and hot-swap it."""
+        frames: list[np.ndarray] = []
+        for _ in range(n):
+            raw = self.latest_raw
+            if raw is not None:
+                frames.append(raw.astype(np.float32).copy())
+            time.sleep(0.08)
+        if len(frames) < 3:
+            return {"ok": False, "error": "预览帧不足，请等相机出画后再标定"}
+        ref = np.mean(frames, axis=0).astype(np.uint8)
+        lut = calibrate_shading(
+            ref, tiles=24, min_gain=0.65, max_gain=1.45,
+            anchor="white", flatten_luma=True,
+        )
+        serial = self.serial or "unknown"
+        out = Path(self.opts.capture_root) / SHADING_DIR / f"{serial}_shading.json"
+        lut.save(out, extra={
+            "serial": serial, "anchor": "white", "flatten_luma": True,
+            "white_balance": int(self.opts.wb),
+        })
+        self.lut = lut
+        return {
+            "ok": True, "path": str(out), "tiles": lut.tiles,
+            "v_bands": 0 if lut.v_grid is None else int(lut.v_grid.shape[1]),
+            "message": f"已更新校色 LUT（{lut.tiles}×{lut.tiles} + 竖直残差）",
+        }
 
     def _run(self) -> None:
         opts = self.opts
@@ -202,18 +377,44 @@ class CameraWorker:
             info = cam._read_info(cam._profile.get_device())
             self.serial = info.serial
             self.color = info.color
+            self.camera_controls = cam.exposure_controls()
+            self._base_exposure = max(1.0, float(self.camera_controls.get("exposure") or 1.0))
+            self.opts.exposure = int(round(self._base_exposure))
+            self.opts.gain = int(round(float(self.camera_controls.get("gain") or 0.0)))
             self.lut = _load_shading_lut(
                 _ShadingOpts(opts.apply_shading, opts.shading_lut, opts.capture_root),
                 info.serial,
             )
             while not self._stop.is_set():
+                if self._control_req is not None:
+                    request_payload = self._control_req
+                    self._control_req = None
+                    self._control_result = self._apply_exposure_request(cam, request_payload)
+                    self._control_done.set()
+
                 bundle = cam.grab(index="01", yaw_deg=0)
                 self.latest_raw = bundle.color
+                preview_bgr = self.lut.apply(bundle.color) if self.lut is not None else bundle.color
                 # JPEG for MJPEG preview (downscale a bit to keep it snappy)
-                prev = _long_edge_resize(bundle.color, 960)
+                prev = _long_edge_resize(preview_bgr, 960)
                 ok, buf = cv2.imencode(".jpg", prev, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 if ok:
                     self.latest_jpeg = buf.tobytes()
+                self._frame_count += 1
+                if self._frame_count % 6 == 1:
+                    quality_frame = _long_edge_resize(bundle.color, 960)
+                    self.latest_quality = _gate_payload(gate_frame(
+                        quality_frame,
+                        min_sharpness=opts.min_sharpness,
+                        max_exposure=opts.max_exposure,
+                        min_object_ratio=opts.min_object_ratio,
+                        max_object_ratio=opts.max_object_ratio,
+                    ))
+                    if self.camera_controls.get("auto_exposure"):
+                        try:
+                            self.camera_controls = cam.exposure_controls()
+                        except Exception:
+                            pass
 
                 if self._capture_req is not None:
                     req = self._capture_req
@@ -241,10 +442,9 @@ class CameraWorker:
             min_object_ratio=opts.min_object_ratio,
             max_object_ratio=opts.max_object_ratio,
         )
-        if not gate.ok:
-            self._capture_result = {"ok": False, "reason": gate.reason, "gate": {
-                "sharpness": gate.sharpness, "exposure": gate.exposure, "object_ratio": gate.object_ratio}}
-            return
+        # WebUI gates are advisory: operators must always be able to capture.
+        # The quality verdict and warnings are persisted for later review.
+        gate_data = _gate_payload(gate)
 
         capture_dir = opts.capture_root / batch / sku
         color_dir = capture_dir / "color"
@@ -269,14 +469,24 @@ class CameraWorker:
                        "auto_white_balance": False, "auto_exposure": False}},
             "frames": [], "status": "captured",
         }
-        cap["camera"]["serial"] = self.serial
+        camera_meta = cap.setdefault("camera", {})
+        camera_meta["serial"] = self.serial
+        camera_meta["color"] = self.color
+        camera_meta["color_controls"] = {
+            "white_balance": self.opts.wb,
+            "exposure": self.camera_controls.get("exposure", self.opts.exposure),
+            "gain": self.camera_controls.get("gain", self.opts.gain),
+            "ev": self._ev,
+            "auto_white_balance": False,
+            "auto_exposure": bool(self.camera_controls.get("auto_exposure", False)),
+        }
         frames = cap.setdefault("frames", [])
         existing = next((f for f in frames if f.get("index") == index), None)
         frame_entry = {
             "index": index, "yaw_deg": yaw, "pose": "yaw",
             "hunyuan": _hunyuan_field(index),
             "color": f"color/{color_file}", "depth": None,
-            "gate": {"sharpness": gate.sharpness, "exposure": gate.exposure, "object_ratio": gate.object_ratio},
+            "gate": gate_data,
             "ok": True, "captured_at": _now_iso(),
         }
         if existing:
@@ -285,8 +495,15 @@ class CameraWorker:
         cap["status"] = "captured"
         _write_json(cap_path, cap)
 
-        self._capture_result = {"ok": True, "index": index, "relative": f"color/{color_file}",
-                                "path": str(color_dir / color_file), "gate": frame_entry["gate"]}
+        self._capture_result = {
+            "ok": True,
+            "quality_ok": gate.ok,
+            "warning": "；".join(gate_data["warnings"]),
+            "index": index,
+            "relative": f"color/{color_file}",
+            "path": str(color_dir / color_file),
+            "gate": frame_entry["gate"],
+        }
 
     def _do_barcode_capture(self, req: dict, raw_bgr: np.ndarray) -> None:
         """Grab + decode the SKU barcode, archive the image (outside `frames`),
@@ -410,6 +627,16 @@ def create_app(opts: WebOptions) -> Flask:
     @app.route("/info")
     def info():
         return jsonify({"serial": worker.serial, "color": worker.color})
+
+    @app.route("/camera/status")
+    def camera_status():
+        return jsonify(worker.status())
+
+    @app.route("/camera/exposure", methods=["POST"])
+    def camera_exposure():
+        payload = request.get_json(silent=True) or {}
+        result = worker.request_exposure(payload)
+        return jsonify(result), 200 if result.get("ok") else 400
 
     @app.route("/capture", methods=["POST"])
     def capture():

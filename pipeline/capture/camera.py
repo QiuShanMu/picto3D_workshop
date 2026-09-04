@@ -202,6 +202,78 @@ class D435iCamera:
         ctrl.exposure = int(_get(rs.option.exposure, snap_exposure))
         ctrl.gain = int(_get(rs.option.gain, snap_gain))
 
+    def _rgb_sensor(self):
+        if self._dev is None:
+            raise RuntimeError("camera is not open")
+        try:
+            return next(
+                sensor
+                for sensor in self._dev.query_sensors()
+                if "RGB" in sensor.get_info(rs.camera_info.name)
+            )
+        except StopIteration as exc:
+            raise RuntimeError("RGB sensor not found") from exc
+
+    @staticmethod
+    def _option_range(sensor, option) -> dict | None:
+        try:
+            if not sensor.supports(option):
+                return None
+            value = sensor.get_option_range(option)
+            return {
+                "min": float(value.min),
+                "max": float(value.max),
+                "step": float(value.step),
+                "default": float(value.default),
+            }
+        except Exception:
+            return None
+
+    def exposure_controls(self) -> dict:
+        """Return live RGB exposure controls as plain JSON-friendly values."""
+        sensor = self._rgb_sensor()
+
+        def read(option, default=0.0) -> float:
+            try:
+                return float(sensor.get_option(option)) if sensor.supports(option) else default
+            except Exception:
+                return default
+
+        return {
+            "auto_exposure": bool(round(read(rs.option.enable_auto_exposure))),
+            "exposure": read(rs.option.exposure),
+            "gain": read(rs.option.gain),
+            "exposure_range": self._option_range(sensor, rs.option.exposure),
+            "gain_range": self._option_range(sensor, rs.option.gain),
+        }
+
+    def set_exposure_controls(
+        self,
+        *,
+        auto_exposure: bool,
+        exposure: float | None = None,
+        gain: float | None = None,
+    ) -> dict:
+        """Apply live RGB exposure settings and return the actual clamped values."""
+        sensor = self._rgb_sensor()
+        sensor.set_option(rs.option.enable_auto_exposure, 1.0 if auto_exposure else 0.0)
+        if not auto_exposure:
+            for option, raw in ((rs.option.exposure, exposure), (rs.option.gain, gain)):
+                if raw is None or not sensor.supports(option):
+                    continue
+                limits = sensor.get_option_range(option)
+                value = min(float(limits.max), max(float(limits.min), float(raw)))
+                if limits.step:
+                    value = float(limits.min) + round(
+                        (value - float(limits.min)) / float(limits.step)
+                    ) * float(limits.step)
+                sensor.set_option(option, value)
+        controls = self.exposure_controls()
+        self.color_controls.auto_exposure = controls["auto_exposure"]
+        self.color_controls.exposure = int(round(controls["exposure"]))
+        self.color_controls.gain = int(round(controls["gain"]))
+        return controls
+
     def close(self) -> None:
         if self._pipeline is not None:
             try:

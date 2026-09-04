@@ -8,6 +8,7 @@ Turns filesystem state into a JSON-friendly batch summary:
 """
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pipeline.capture.batch import DEFAULT_REQUIRED
@@ -60,13 +61,13 @@ def scan_batch(
             total += 1
             if cap is None:
                 no_capture += 1
-                skus.append(_sku_entry(sku_id, batch_id, "no_capture", [], list(required), sku_dir))
+                skus.append(_sku_entry(sku_id, batch_id, "no_capture", [], list(required), sku_dir, cap))
                 continue
             frames = [f for f in cap.get("frames", []) if f.get("ok")]
             captured = [f.get("index") for f in frames]
             if not captured:
                 no_capture += 1
-                skus.append(_sku_entry(sku_id, batch_id, "no_capture", [], list(required), sku_dir))
+                skus.append(_sku_entry(sku_id, batch_id, "no_capture", [], list(required), sku_dir, cap))
                 continue
             missing = [i for i in required if i not in captured]
             status = "ready" if not missing else "incomplete"
@@ -74,7 +75,11 @@ def scan_batch(
                 ready += 1
             else:
                 incomplete += 1
-            skus.append(_sku_entry(sku_id, batch_id, status, captured, missing, sku_dir))
+            skus.append(_sku_entry(sku_id, batch_id, status, captured, missing, sku_dir, cap))
+
+    # Oldest registration first. SKU is the deterministic tie-breaker, so the
+    # board does not jump around during its five-second refresh.
+    skus.sort(key=lambda item: (item.pop("_registered_sort"), item["sku_id"]))
 
     return {
         "batch_id": batch_id,
@@ -86,10 +91,62 @@ def scan_batch(
     }
 
 
-def _sku_entry(sku_id: str, batch_id: str, status: str, captured: list[str], missing: list[str], sku_dir: Path) -> dict:
+def _parse_timestamp(raw) -> tuple[str, float] | None:
+    if not raw:
+        return None
+    text = str(raw)
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return text, dt.timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _registration_time(cap: dict | None, sku_dir: Path) -> tuple[str, float, str]:
+    """Resolve first-entry time, including fallbacks for historical captures."""
+    cap = cap or {}
+    candidates = [
+        (cap.get("registered_at"), "registered_at"),
+        (((cap.get("barcode") or {}).get("captured_at")), "barcode.captured_at"),
+        (cap.get("started_at"), "capture.started_at"),
+    ]
+    frame_times = [
+        parsed
+        for parsed in (_parse_timestamp(f.get("captured_at")) for f in cap.get("frames", []))
+        if parsed is not None
+    ]
+    if frame_times:
+        first_frame = min(frame_times, key=lambda item: item[1])
+        candidates.append((first_frame[0], "frame.captured_at"))
+    for raw, source in candidates:
+        parsed = _parse_timestamp(raw)
+        if parsed is not None:
+            return parsed[0], parsed[1], source
+    try:
+        timestamp = sku_dir.stat().st_mtime
+    except OSError:
+        timestamp = 0.0
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(), timestamp, "filesystem.mtime"
+
+
+def _sku_entry(
+    sku_id: str,
+    batch_id: str,
+    status: str,
+    captured: list[str],
+    missing: list[str],
+    sku_dir: Path,
+    cap: dict | None = None,
+) -> dict:
+    registered_at, registered_sort, registered_source = _registration_time(cap, sku_dir)
     return {
         "sku_id": sku_id,
         "batch_id": batch_id,
+        "registered_at": registered_at,
+        "registered_at_source": registered_source,
+        "_registered_sort": registered_sort,
         "status": status,
         "captured_indices": captured,
         "missing_required": missing,
@@ -123,7 +180,12 @@ def _downstream(sku_id: str, batch_id: str) -> dict:
 def sku_state(batch_id: str, sku_id: str, *, capture_root: Path = Path(DEFAULT_CAPTURE_ROOT)) -> dict:
     cap = _load_json(capture_root / batch_id / sku_id / "capture.json")
     if cap is None:
-        return {"sku_id": sku_id, "batch_id": batch_id, "status": "no_capture", "frames": []}
+        return {
+            "sku_id": sku_id, "batch_id": batch_id, "status": "no_capture",
+            "already_captured": False, "captured_count": 0,
+            "captured_indices": [], "missing_required": list(DEFAULT_REQUIRED),
+            "frames": [],
+        }
     frames = [f for f in cap.get("frames", []) if f.get("ok")]
     captured = [f.get("index") for f in frames]
     missing = [i for i in DEFAULT_REQUIRED if i not in captured]
@@ -132,6 +194,8 @@ def sku_state(batch_id: str, sku_id: str, *, capture_root: Path = Path(DEFAULT_C
         "sku_id": sku_id,
         "batch_id": batch_id,
         "status": status,
+        "already_captured": bool(captured),
+        "captured_count": len(captured),
         "captured_indices": captured,
         "missing_required": missing,
         "frames": frames,
@@ -293,10 +357,12 @@ def sku_detail(
             "metrics": (vrep or {}).get("metrics", {}),
         })
     archived = bool(list(archive_root.glob(f"*/{batch_id}/{sku_id}/meta.json")))
+    sku_meta = _load_json(work_dir / "meta.json") or {}
 
     return {
         "sku_id": sku_id,
         "batch_id": batch_id,
+        "size_mm": sku_meta.get("size_mm"),
         "status": status,
         "captured_indices": captured,
         "missing_required": missing,

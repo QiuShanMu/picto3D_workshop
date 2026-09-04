@@ -7,18 +7,24 @@ archive_sku) so the WebUI triggers actual work rather than mock buttons.
 """
 
 import json
+import shutil
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
+from pipeline.capture.batch import DEFAULT_REQUIRED
 from pipeline.queue.run import process_sku, _next_version
 from pipeline.validate.run import run_validate
 from pipeline.archive.run import archive_sku
 
 DEFAULT_API_ROOT = "data/api"
+DEFAULT_CAPTURE_ROOT = "data/captures"
+DEFAULT_INCOMING_ROOT = "data/incoming"
 DEFAULT_WORK_ROOT = "data/work"
 DEFAULT_ARCHIVE_ROOT = "data/archive"
 DEFAULT_FIXTURE_DIR = "experiments/fixtures"
+DEFAULT_TRASH_ROOT = "data/trash"
 
 # ---- background generate tasks (single-process registry for the WebUI) ----
 # key: f"{batch_id}/{sku_id}"  value: {status, version, job_id, message, started_at, finished_at}
@@ -81,6 +87,172 @@ def _save_sku_meta(work_root: Path, batch_id: str, sku_id: str, meta: dict) -> N
     p = _meta_path(work_root, batch_id, sku_id)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def parse_size_mm(raw) -> tuple[float, float, float] | None:
+    """Parse ``L,W,H`` / list into three positive millimetres. Empty → None."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (list, tuple)):
+        parts = list(raw)
+    else:
+        parts = str(raw).replace("×", ",").replace("x", ",").replace("X", ",").split(",")
+    parts = [p for p in (str(x).strip() for x in parts) if p]
+    if len(parts) < 3:
+        raise ValueError("需要 3 个数值（长,宽,高）")
+    mm = tuple(float(x) for x in parts[:3])
+    if any(x <= 0 for x in mm):
+        raise ValueError("尺寸必须为正数")
+    return mm
+
+
+def save_size_mm(sku_id: str, batch_id: str, size_mm,
+                 *, work_root: Path | None = None) -> dict:
+    """Persist a corrected target size onto ``work/<batch>/<sku>/meta.json``."""
+    if not sku_id or not batch_id:
+        return {"ok": False, "error": "缺少 sku / batch"}
+    try:
+        mm = parse_size_mm(size_mm)
+    except Exception as exc:
+        return {"ok": False, "error": f"尺寸解析失败: {exc}"}
+    if mm is None:
+        return {"ok": False, "error": "请填写目标尺寸（长,宽,高）"}
+    work_root = work_root or Path(DEFAULT_WORK_ROOT)
+    meta = _load_sku_meta(work_root, batch_id, sku_id)
+    stored = [round(x, 3) for x in mm]
+    meta["size_mm"] = stored
+    _save_sku_meta(work_root, batch_id, sku_id, meta)
+    text = f"{stored[0]},{stored[1]},{stored[2]}"
+    return {"ok": True, "size_mm": stored, "message": f"已保存 {text}"}
+
+
+def _safe_segment(value: str) -> bool:
+    return bool(
+        value
+        and value not in {".", ".."}
+        and Path(value).name == value
+        and "/" not in value
+        and "\\" not in value
+    )
+
+
+def _referenced_file(base: Path, relative: str) -> Path | None:
+    if not relative:
+        return None
+    base = base.resolve()
+    candidate = (base / relative).resolve()
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        raise ValueError(f"采集记录包含越界路径: {relative}")
+    return candidate
+
+
+def delete_capture_frame(
+    sku_id: str,
+    batch_id: str,
+    index: str,
+    *,
+    capture_root: Path | None = None,
+    incoming_root: Path | None = None,
+    api_root: Path | None = None,
+    work_root: Path | None = None,
+    trash_root: Path | None = None,
+) -> dict:
+    """Remove one captured view and quarantine its source/derived files."""
+    sku_id = str(sku_id or "").strip()
+    batch_id = str(batch_id or "").strip()
+    index = str(index or "").strip()
+    if not _safe_segment(sku_id) or not _safe_segment(batch_id):
+        return {"ok": False, "error": "batch / sku 非法"}
+    if index not in {f"{n:02d}" for n in range(1, 11)}:
+        return {"ok": False, "error": "档位必须是 01–10"}
+
+    capture_root = Path(capture_root or DEFAULT_CAPTURE_ROOT)
+    incoming_root = Path(incoming_root or DEFAULT_INCOMING_ROOT)
+    api_root = Path(api_root or DEFAULT_API_ROOT)
+    work_root = Path(work_root or DEFAULT_WORK_ROOT)
+    trash_root = Path(trash_root or DEFAULT_TRASH_ROOT)
+    capture_dir = capture_root / batch_id / sku_id
+    cap_path = capture_dir / "capture.json"
+    if not cap_path.is_file():
+        return {"ok": False, "error": "未找到该 SKU 的 capture.json"}
+    try:
+        cap = json.loads(cap_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"ok": False, "error": f"capture.json 读取失败: {exc}"}
+
+    frames = cap.get("frames", [])
+    target = next((frame for frame in frames if frame.get("index") == index and frame.get("ok")), None)
+    if target is None:
+        return {"ok": False, "error": f"档位 {index} 没有可删除的采集图片"}
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    trash_dir = trash_root / "frame-delete" / stamp / batch_id / sku_id
+    moves: list[tuple[Path, Path]] = []
+    try:
+        for field in ("color", "depth"):
+            source = _referenced_file(capture_dir, str(target.get(field) or ""))
+            if source is not None and source.is_file():
+                moves.append((source, trash_dir / "capture" / source.relative_to(capture_dir.resolve())))
+
+        for label, root in (("incoming", incoming_root), ("api", api_root)):
+            source_dir = root / batch_id / sku_id
+            if source_dir.is_dir():
+                for source in source_dir.glob(f"{sku_id}_{index}.*"):
+                    if source.is_file():
+                        moves.append((source, trash_dir / label / source.name))
+
+        # These reports/manifests describe the old image set and must be
+        # regenerated after the replacement frame is captured.
+        stale_metadata = (
+            (incoming_root / batch_id / sku_id / "handoff.json", "incoming"),
+            (incoming_root / batch_id / sku_id / "handoff_report.json", "incoming"),
+            (api_root / batch_id / sku_id / "report.json", "api"),
+        )
+        for source, label in stale_metadata:
+            if source.is_file():
+                moves.append((source, trash_dir / label / source.name))
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for source, destination in moves:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+            moved.append((source, destination))
+
+        remaining = [frame for frame in frames if frame.get("index") != index]
+        captured = [frame.get("index") for frame in remaining if frame.get("ok") and frame.get("index")]
+        cap["frames"] = remaining
+        metrics = cap.setdefault("session_metrics", {})
+        metrics["ok_frames"] = len(captured)
+        metrics["captured_indices"] = captured
+        metrics["missing_required"] = [slot for slot in DEFAULT_REQUIRED if slot not in captured]
+        cap["updated_at"] = datetime.now(timezone.utc).isoformat()
+        tmp = cap_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cap, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(cap_path)
+    except Exception as exc:
+        for source, destination in reversed(moved):
+            if destination.exists() and not source.exists():
+                source.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(destination), str(source))
+        return {"ok": False, "error": f"删除失败，已尝试回滚: {exc}"}
+
+    has_model = any((work_root / batch_id / sku_id).glob("v*/model.glb"))
+    warning = "已有模型仍基于旧图片；补拍后请重新交接、预处理并生成。" if has_model else ""
+    return {
+        "ok": True,
+        "sku_id": sku_id,
+        "index": index,
+        "trash_dir": str(trash_dir),
+        "moved_files": len(moved),
+        "captured_indices": captured,
+        "warning": warning,
+        "message": f"已删除档位 {index}，现在可以重新采集该档。",
+    }
 
 
 def _apply_validate(sku: str, batch_id: str, work_root: Path, version_dir: Path,
@@ -234,10 +406,14 @@ def size_correct(sku_id: str, batch_id: str, version: str, size_mm,
 
     # re-validate at the corrected size
     rep = run_validate(out, size_mm=target, out_path=new_dir / "report.json")
+    stored = [round(x, 3) for x in target]
+    meta = _load_sku_meta(work_root, batch_id, sku_id)
+    meta["size_mm"] = stored
+    _save_sku_meta(work_root, batch_id, sku_id, meta)
     return {
         "ok": True,
         "new_version": new_version,
-        "size_mm": [round(x, 3) for x in target],
+        "size_mm": stored,
         "model": str(out),
         "real_bbox_mm": real_bbox_mm,
         "validate_verdict": rep.verdict,
