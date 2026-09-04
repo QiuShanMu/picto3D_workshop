@@ -104,6 +104,14 @@ async function loadModel(url){
   try{
     const { GLTFLoader } = await import('/static/vendor/three/loaders/GLTFLoader.js');
     const loader = new GLTFLoader();
+    try{
+      const { KTX2Loader } = await import('/static/vendor/three/loaders/KTX2Loader.js');
+      const ktx2 = await new KTX2Loader()
+        .setTranscoderPath('/static/vendor/three/libs/basis/')
+        .detectSupport(renderer)
+        .promise;
+      loader.setKTX2Loader(ktx2);
+    }catch(err){ console.warn('KTX2 init failed, loading uncompressed only:', err); }
     const gltf = await new Promise((res, rej)=>loader.load(url, res, undefined, rej));
     if(root) scene.remove(root);
     root = new THREE.Group();
