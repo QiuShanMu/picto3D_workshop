@@ -222,10 +222,28 @@ function updateExposureDisabled(){
   $('evControl').disabled=auto;
   $('gainControl').disabled=auto;
 }
+function setExposureSupported(supported){
+  // 设备不支持曝光控制时：控键置灰，但保留亮度/曝光提醒。
+  const disabled=!supported;
+  $('evControl').disabled=disabled;
+  $('gainControl').disabled=disabled;
+  $('autoExposure').disabled=disabled;
+  $('applyExposure').disabled=disabled;
+  $('applyExposure').classList.toggle('btn-soft',!disabled);
+  if(!disabled){
+    // 恢复自动曝光对 EV/增益的联动禁用
+    updateExposureDisabled();
+  }
+}
 function renderCameraStatus(data){
   const q=data.quality||{};
   const controls=data.controls||{};
-  if(!exposureInitialized && controls.exposure!==undefined){
+  const supported=data.supports_exposure_control!==false;
+  setExposureSupported(supported);
+  if(!supported){
+    $('exposureActual').textContent='设备不支持曝光控制，可手动调整布光或用下方亮度提醒';
+    $('exposureActual').className='status warn';
+  }else if(!exposureInitialized && controls.exposure!==undefined){
     $('autoExposure').checked=!!controls.auto_exposure;
     $('evControl').value=Number(data.ev||0).toFixed(1);
     $('gainControl').value=Math.round(controls.gain||0);
@@ -233,8 +251,9 @@ function renderCameraStatus(data){
     updateExposureDisabled();
   }
   $('evValue').textContent=(Number($('evControl').value)>=0?'+':'')+Number($('evControl').value).toFixed(1);
-  if(controls.exposure!==undefined){
+  if(supported && controls.exposure!==undefined){
     $('exposureActual').textContent=`当前曝光 ${Math.round(controls.exposure)} · 增益 ${Math.round(controls.gain||0)}${controls.auto_exposure?' · 自动':''}`;
+    $('exposureActual').className='hint';
   }
   if(q.sharpness!==undefined) $('gSharp').textContent=Number(q.sharpness).toFixed(1);
   if(q.exposure!==undefined) $('gExp').textContent=(Number(q.exposure)*100).toFixed(1)+'%';

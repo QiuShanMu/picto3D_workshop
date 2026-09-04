@@ -19,7 +19,8 @@ import cv2
 import numpy as np
 
 from pipeline.capture.barcode import decode_barcode
-from pipeline.capture.camera import ColorControls, D435iCamera, list_devices, save_camera_json
+from pipeline.capture.camera import ColorControls, save_camera_json
+from pipeline.capture.device import make_capture_device, list_capture_devices
 from pipeline.capture.gate import gate_frame
 from pipeline.capture.shading import ShadingLUT
 from pipeline.views import SLOTS
@@ -38,6 +39,7 @@ class CaptureOptions:
     operator: str = ""
     tilt_deg: int = 25
     capture_root: Path = Path(DEFAULT_CAPTURE_ROOT)
+    camera_kind: str = "d435i"  # "d435i" | "android_usb"; drives make_capture_device
     serial: str | None = None
     enable_depth: bool = True
     pose_mode: str = "yaw_manual_marks"
@@ -167,37 +169,50 @@ def capture_sku(opts: CaptureOptions) -> CaptureResult:
     capture_dir = opts.capture_root / opts.batch_id / opts.sku_id
     color_dir = capture_dir / "color"
     depth_dir = capture_dir / "depth"
+    # Non-D435i devices (e.g. Android phone) have no depth stream; don't build
+    # an empty depth dir or request a stream they can't provide.
+    if opts.camera_kind != "d435i":
+        opts.enable_depth = False
     color_dir.mkdir(parents=True, exist_ok=True)
     if opts.enable_depth:
         depth_dir.mkdir(parents=True, exist_ok=True)
 
-    devices = list_devices()
+    devices = list_capture_devices(opts.camera_kind)
     if not devices:
-        raise RuntimeError("no RealSense device found; check USB / driver")
+        raise RuntimeError(
+            f"no {opts.camera_kind} device found; check USB / driver"
+            if opts.camera_kind == "d435i"
+            else "no Android USB camera found; check `adb devices` / spyglass tunnel"
+        )
 
     frames: list[dict] = []
     camera_info = None
     lut = None
     lut_path = None
 
-    cam = D435iCamera(
+    dev = make_capture_device(
+        opts.camera_kind,
         serial=opts.serial,
         enable_depth=opts.enable_depth,
         tilt_deg=opts.tilt_deg,
         color_controls=opts.color_controls,
     )
     try:
-        camera_info = cam.open()
+        camera_info = dev.open()
         if opts.serial and camera_info.serial != opts.serial:
             raise RuntimeError(f"expected serial {opts.serial}, got {camera_info.serial}")
 
         save_camera_json(capture_dir / "camera.json", camera_info, tilt_deg=opts.tilt_deg)
 
-        # Load per-camera flat-field correction (removes center/edge color cast).
-        lut_path = _resolved_lut_path(opts, camera_info.serial)
-        lut = _load_shading_lut(opts, camera_info.serial)
-        if opts.apply_shading and lut is None:
-            print(f"  [warn] no shading LUT for {camera_info.serial}; run calibration to fix color cast")
+        # Per-camera flat-field correction only for devices that support it
+        # (D435i has a LUT; the phone relies on its ISP colour pipeline).
+        if dev.capabilities.supports_shading:
+            lut_path = _resolved_lut_path(opts, camera_info.serial)
+            lut = _load_shading_lut(opts, camera_info.serial)
+            if opts.apply_shading and lut is None:
+                print(f"  [warn] no shading LUT for {camera_info.serial}; run calibration to fix color cast")
+        else:
+            print(f"  [info] device '{opts.camera_kind}' has no shading LUT; skip flat-field correction")
 
         # Session starts at 01 (front, yaw 0). The operator then turns CCW through the marks.
         ordered = [s for s in SLOTS if s.degrees >= 0]  # yaw only; 09/10 handled separately
@@ -217,7 +232,7 @@ def capture_sku(opts: CaptureOptions) -> CaptureResult:
             print("\n[SKU 条码采集] Put the SKU barcode label in front of the camera.")
             bkey = _confirm("  [b]shoot barcode  [s]skip  > ")
             if bkey == "b":
-                bc_bundle = cam.grab(index="bc", yaw_deg=0)
+                bc_bundle = dev.grab(index="bc", yaw_deg=0)
                 _atomic_write_bgr(color_dir / "barcode.jpg", bc_bundle.color, JPEG_QUALITY)
                 bdec = decode_barcode(bc_bundle.color)
                 bc_value = bdec.value if bdec.ok else ""
@@ -255,7 +270,7 @@ def capture_sku(opts: CaptureOptions) -> CaptureResult:
                 print(f"  Skipped {slot.index}.")
                 continue
             # SPACE (or empty/enter) = shoot
-            bundle = cam.grab(index=slot.index, yaw_deg=slot.degrees)
+            bundle = dev.grab(index=slot.index, yaw_deg=slot.degrees)
             gate = gate_frame(
                 bundle.color,
                 min_sharpness=opts.min_sharpness,
@@ -301,7 +316,7 @@ def capture_sku(opts: CaptureOptions) -> CaptureResult:
             )
             print(f"  Saved {slot.index} -> {color_file}")
     finally:
-        cam.close()
+        dev.close()
 
     # Write capture.json (schema v1 per spec-capture).
     capture_json: dict = {
@@ -314,6 +329,7 @@ def capture_sku(opts: CaptureOptions) -> CaptureResult:
         "pose_mode": opts.pose_mode,
         "rotation": {"method": "manual_marks", "step_deg": 45, "direction": "ccw"},
         "camera": {
+            "kind": opts.camera_kind,  # "d435i" | "android_usb" (backward-compatible addition)
             "model": camera_info.model if camera_info else "",
             "serial": camera_info.serial if camera_info else "",
             "color": camera_info.color if camera_info else "1920x1080",
@@ -330,6 +346,10 @@ def capture_sku(opts: CaptureOptions) -> CaptureResult:
                 else None
             ),
             "shading_lut": str(lut_path) if lut_path else None,
+            "transit": "USB3/RealSense" if opts.camera_kind == "d435i" else "USB/ADB tunnel",
+            "gate_defaults": getattr(dev, "capabilities", None).gate_defaults
+            if getattr(dev, "capabilities", None)
+            else {},
         },
         "target_views": _build_target_views(),
         **( {"barcode": barcode_meta} if barcode_meta else {} ),

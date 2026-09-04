@@ -22,6 +22,7 @@
 | 状态、校验、重跑 | `docs/spec-orchestration.md` |
 | 拍摄作业 | `零售多SKU图生3D全流程方案.md` |
 | D435i 采集/入库 | `docs/spec-capture.md` |
+| 多设备采集适配 | `docs/spec-multi-camera.md` |
 | 混元视角实验 | `docs/spec-hunyuan-grid.md` |
 
 作业规范是业务源；与 API 冲突时以 `docs/` 里「对齐后的行为」为准。
@@ -38,6 +39,10 @@
 
 > 扫码枪 Qp2100 **不要走后台全局钩子（如 pynput 全局键盘监听）、不要走串口（需配置条码，Qp2100 无）、不要用 `msvcrt` 控制台读键**——这些在被否决的探索中均不可靠。根因：扫码枪是键盘模式，字符进了**前台焦点窗口**（如 Cursor 对话输入框 WebView），后台钩子抓不到；且 **RDP 远程键鼠会占用输入通道**（远程时扫不进/设备消失）。关掉 RDP 本地直连即插即用。手机当摄像头那条路（`pipeline.scan.app` / `p3d-scan --https`）照旧有效，与扫码枪并存。
 
+**安卓 USB 相机（隔离实验，未入主流程）**：`experiments/android_usb_cam/` 是**实验阶段0**，2026-09-03 已跑通「手机→USB(ADB 隧道)→Python 解码→进入 gate/handoff/preprocess」闭环；**主项目 `pipeline/`、`docs/`、`webui/` 零改动**（`experiments/` 被根 `.gitignore` 排除）。移动端选 **`kafkasl/spyglass`**（开源 DroidCam 替代品，MIT、`GET /snap` 按需抓 JPEG、端口 4747），`build_spyglass.ps1` 自动下载 JDK17+Android SDK 并自建 APK 后 `adb install`（本机无 Android 环境也 OK）。**2026-09-03 又修复了 spyglass 的 `POST /config` 500**：根因是 `applyConfig`(→`bindCamera`→`bindToLifecycle`) 跑在 NanoHTTPD 后台线程，而 CameraX `bindToLifecycle` 强制主线程；已把切相机动作 `post` 到主线程。同次改动让 `bindCamera` 按 `availableCameraInfos` 索引选镜头（原来非 1 一律 `DEFAULT_BACK_CAMERA` 选不到别的镜头），`GET /status` 增加 `cameras` 报告各相机 `facing`。**网格实验结论**：该华为机 `availableCameraInfos` 枚举出 6 个逻辑相机，但**只有 `cam0` 真正清晰**（lapvar≈216 vs 其余 ~6；cam1/cam3 全黑、cam2/4/5 糊）；分辨率被 CameraX 就近映射成**方形**（请求 3264x2448 → 实际 **3072x3072**，q95 时 sharp≈130~216）；推荐配置 `camera_id=0, resolution=3264x2448, jpeg_quality=95, fps=15`。**snap 延迟≈0.03~0.08s**（读最近已编码帧，旧 README 记的 5s 是未预热/慢速情形）。关键结论：**现有 `gate_frame` 阈值对手机源偏高**（手机帧 sharp≈132、obj≈36.6%），需下调 `min_sharpness`(60→30)、`min_object_ratio`(0.40→0.08)，即**新输入源必须按实测重标定 gate 阈值**。真 4K/1080p 需自研 App 走 Camera2 TakePicture（已确认不并入主流程前不做）。
+
+**多设备采集适配（方案筹备→已对齐生产基线，2026-09-04）**：规划「**保留 D435i、同时接入手机（安卓 USB）相机、支持多类采集设备**」。契约见 `docs/spec-multi-camera.md`；衔接材料见 `experiments/android_usb_cam/BRIDGE_TO_MAIN.md`。核心思路：① 抽象 `CaptureDevice` 协议（`open/grab/close` + `DeviceCapabilities`，含 has_depth/has_imu/supports_shading/**supports_exposure_control**/gate_defaults），工厂 `make_capture_device(kind, ...)` 按 `d435i|android_usb|both` 选择；② 复用现有 `CameraInfo`/`FrameBundle`；③ **下游零改动**——`handoff/preprocess/hunyuan/validate/archive` 只认 `frames[].color` + `incoming/SKU_0X.jpg`，手机源只需产出**同构 `capture.json`**；④ 只改 3 处衔接：`run.py::capture_sku`、`webapp.py::CameraWorker`（生产 WebUI 采集台复用它）、`webui/__main__.py`（加 `--camera` 参数）；⑤ 设备差异落 `capture.json.camera`（新增 `kind`/`transit`/`camera_id`/`resource`，向后兼容）。手机设备：无 depth/IMU/shading/**exposure**（`gate_defaults={sharp:30,obj:0.08~0.97}`，D435i 保持 `{sharp:60,obj:0.40~0.92}`）。**已对齐生产 c161ecf**：生产给 `D435iCamera` 新增实时曝光控制（EV/增益/自动曝光），`D435iDevice` 需透传 `exposure_controls`/`set_exposure_controls`；手机 `supports_exposure_control=False` 时 `CameraWorker.status()` 返回 `supports_exposure_control=false`，前端 `capture.html` 的 `setExposureSupported()` **置灰曝光控件（EV/增益/自动曝光/应用曝光）并保留曝光+亮度提醒**（`exposureActual` 显示"设备不支持曝光控制"，`brightnessHint` 照常按亮度评估更新）——优雅降级而非整块隐藏。**2026-09-04 已真机验证**：手机（`NABDU20512011233`）经 spyglass 拉帧跑通——`AndroidUsbDevice.open()`（POST config ≤/snap）+ `grab()` 得 `3072x3072`（请求 3264x2448 被 CameraX 映射方形），gate 手机阈值 `sharp=33.6/exp=0.0007/obj=35%` 通过；手机源产出**同构 `capture.json`** 后 `handoff`（下游关键模块）**零改动正常导出**。实现注意：`AndroidUsbDevice.open()` 在 `POST /config` 后需 `settle≈0.8s`（CameraX rebind 前 `/snap` 读到旧低清帧如 1456x1456→sharp<30 被拒）；`_adb_forward()` 需把 `tcp:4747:4747` 解析成 `adb forward tcp:4747 tcp:4747`（勿 `split(":")` 成 4 段）。
+
 - `python -m pipeline.capture [--with-barcode]`：多档位手转采集（空格拍/s 跳过/q 结束；`--with-barcode` 会话开头拍条码）。
 - `python -m pipeline.capture --calibrate-shading`：标定平场 LUT（换机/换布光才重跑）。
 - `python -m pipeline.capture.handoff_main <capture_dir>`：T4 导出到 incoming。
@@ -46,7 +51,7 @@
 - `python -m pipeline.queue <batch> --provider mock`：生成队列（mock 跑通）。
 - `python -m pipeline.validate <model.glb> --size-mm W,H,D`：模型校验。
 - `python -m pipeline.archive <sku> <batch> --category <cat>`：归档到目录。
-- `python -m pipeline.webui --batch <b> [--no-camera] --provider mock|auto`：生产 WebUI（多工作台，含 SKU 详情·图审 / 后台异步生成）。
+- `python -m pipeline.webui --batch <b> [--no-camera] [--camera d435i|android_usb] --provider mock|auto`：生产 WebUI（多工作台，含 SKU 详情·图审 / 后台异步生成；`--camera` 选采集设备，默认 `d435i`，`android_usb` 走手机 spyglass）。
 - WebUI 内：看板 `/`、采集台 `/capture`（含「① SKU 条码采集」→ 读条码/锁定）、SKU 详情·图审 `/sku/<id>`（图审→填 `size_mm`→「⚙️ 提交生成」后台异步）、3D 生成 `/generate`（勾选→提交→版本）、校验·矫正 `/validate`（verdict/尺寸偏差/一键矫正/归档/重新生成）、查看·尺寸调整 `/viewer3d`、归档 `/archive`。
 - `python -m pipeline.scan --host 0.0.0.0 --port 5070 --https`：独立 SKU 扫码服务（安卓手机当摄像头）。**手机相机需 HTTPS**：用 `https://<电脑IP>:5070/scan`，不要 `http://`。自签名证书自动生成于 `.p3d/cert/`，含局域网 IP SAN。`scripts/start_scan.ps1 -Https` 一键启动。
 - `scripts/start_webui.ps1` / `scripts/demo_e2e.ps1`：一键启动 / 一键全链路演示。

@@ -23,7 +23,9 @@ import numpy as np
 from flask import Flask, Response, jsonify, render_template_string, request
 
 from pipeline.capture.barcode import decode_barcode
-from pipeline.capture.camera import ColorControls, D435iCamera
+from pipeline.capture.camera import ColorControls
+from pipeline.capture.device import make_capture_device
+from pipeline.capture.device_base import CaptureDevice, DeviceCapabilities
 from pipeline.capture.gate import gate_frame
 from pipeline.capture.run import _atomic_write_bgr, _load_shading_lut, _long_edge_resize, OUTPUT_EDGE, JPEG_QUALITY, SHADING_DIR
 from pipeline.capture.shading import calibrate_shading
@@ -137,6 +139,7 @@ class WebOptions:
     batch_id: str = "0812"
     sku_id: str = "APP-0812-001"
     capture_root: Path = Path(DEFAULT_CAPTURE_ROOT)
+    camera_kind: str = "d435i"  # "d435i" | "android_usb"; drives make_capture_device
     serial: str | None = None
     enable_depth: bool = False
     wb: int = 5500
@@ -148,6 +151,8 @@ class WebOptions:
     max_exposure: float = 0.10
     min_object_ratio: float = 0.10
     max_object_ratio: float = 0.98
+    # Android USB camera options (only used when camera_kind == "android_usb")
+    android: dict | None = None  # {camera_id, resolution, fps, jpeg_quality, base_url, adb, adb_forward}
 
 
 def _gate_payload(gate) -> dict:
@@ -205,6 +210,7 @@ class CameraWorker:
         self._ev = 0.0
         self._frame_count = 0
         self._device = None
+        self.capabilities: DeviceCapabilities | None = None
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -249,9 +255,12 @@ class CameraWorker:
             "ev": self._ev,
             "controls": dict(self.camera_controls),
             "quality": dict(self.latest_quality),
+            "supports_exposure_control": bool(
+                self.capabilities and self.capabilities.supports_exposure_control
+            ),
         }
 
-    def _apply_exposure_request(self, cam: D435iCamera, payload: dict) -> dict:
+    def _apply_exposure_request(self, cam: CaptureDevice, payload: dict) -> dict:
         try:
             auto = bool(payload.get("auto_exposure", False))
             ev = float(payload.get("ev", self._ev))
@@ -373,26 +382,44 @@ class CameraWorker:
     def _run(self) -> None:
         opts = self.opts
         ctrl = ColorControls(white_balance=opts.wb, exposure=opts.exposure, gain=opts.gain)
-        with D435iCamera(serial=opts.serial, enable_depth=opts.enable_depth, color_controls=ctrl) as cam:
-            info = cam._read_info(cam._profile.get_device())
+        dev_kwargs = {}
+        if opts.camera_kind == "android_usb" and opts.android:
+            dev_kwargs.update(opts.android)
+        with make_capture_device(opts.camera_kind, serial=opts.serial,
+                                 enable_depth=opts.enable_depth, color_controls=ctrl,
+                                 **dev_kwargs) as dev:
+            self._device = dev
+            self.capabilities = dev.capabilities
+            info = dev.open()
             self.serial = info.serial
             self.color = info.color
-            self.camera_controls = cam.exposure_controls()
-            self._base_exposure = max(1.0, float(self.camera_controls.get("exposure") or 1.0))
-            self.opts.exposure = int(round(self._base_exposure))
-            self.opts.gain = int(round(float(self.camera_controls.get("gain") or 0.0)))
-            self.lut = _load_shading_lut(
-                _ShadingOpts(opts.apply_shading, opts.shading_lut, opts.capture_root),
-                info.serial,
-            )
+            if dev.capabilities.supports_exposure_control:
+                self.camera_controls = dev.exposure_controls() or {}
+                self._base_exposure = max(1.0, float(self.camera_controls.get("exposure") or 1.0))
+                self.opts.exposure = int(round(self._base_exposure))
+                self.opts.gain = int(round(float(self.camera_controls.get("gain") or 0.0)))
+            else:
+                self.camera_controls = {}
+                self._base_exposure = 1.0
+            if dev.capabilities.supports_shading:
+                self.lut = _load_shading_lut(
+                    _ShadingOpts(opts.apply_shading, opts.shading_lut, opts.capture_root),
+                    info.serial,
+                )
+            else:
+                self.lut = None
             while not self._stop.is_set():
-                if self._control_req is not None:
+                if self._control_req is not None and dev.capabilities.supports_exposure_control:
                     request_payload = self._control_req
                     self._control_req = None
-                    self._control_result = self._apply_exposure_request(cam, request_payload)
+                    self._control_result = self._apply_exposure_request(dev, request_payload)
+                    self._control_done.set()
+                elif self._control_req is not None:
+                    self._control_req = None
+                    self._control_result = {"ok": False, "error": "该设备不支持曝光控制"}
                     self._control_done.set()
 
-                bundle = cam.grab(index="01", yaw_deg=0)
+                bundle = dev.grab(index="01", yaw_deg=0)
                 self.latest_raw = bundle.color
                 preview_bgr = self.lut.apply(bundle.color) if self.lut is not None else bundle.color
                 # JPEG for MJPEG preview (downscale a bit to keep it snappy)
@@ -410,9 +437,9 @@ class CameraWorker:
                         min_object_ratio=opts.min_object_ratio,
                         max_object_ratio=opts.max_object_ratio,
                     ))
-                    if self.camera_controls.get("auto_exposure"):
+                    if self.camera_controls.get("auto_exposure") and dev.capabilities.supports_exposure_control:
                         try:
-                            self.camera_controls = cam.exposure_controls()
+                            self.camera_controls = dev.exposure_controls()
                         except Exception:
                             pass
 
@@ -470,6 +497,7 @@ class CameraWorker:
             "frames": [], "status": "captured",
         }
         camera_meta = cap.setdefault("camera", {})
+        camera_meta["kind"] = self.opts.camera_kind
         camera_meta["serial"] = self.serial
         camera_meta["color"] = self.color
         camera_meta["color_controls"] = {
