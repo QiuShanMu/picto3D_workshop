@@ -246,3 +246,70 @@ capture_json["camera"] = {
 3. **下游无感**：手机源 `handoff → preprocess` `verdict=ok`，`api_bytes ≤8MB`，04/06 不上传。
 4. **gate 按设备**：手机源用 `sharp=30/obj=0.08~0.97`，D435i 用 `sharp=60/obj=0.40~0.92`，互不串扰。
 5. **生产 WebUI**：`--camera d435i|android_usb` 均能启动对应采集台（`both` 为规划项）。
+
+---
+
+## 附录 A：候选设备后端 scrcpy（探索记录，2026-09-04）
+
+> **结论先行**：scrcpy（v4.1）的 `--video-source=camera` 能**列出相机 / 合法分辨率 / fps / 变焦范围**，这些是其相对 spyglass 的关键优势。但当前**无「按需抓单帧」接口**（只有 `--record` 整段录像 + 镜像窗口），不像 spyglass 那样 `GET /snap` 可单帧取 JPEG。因此本管线**暂不把 scrcpy 作为采集后端**（保留 spyglass 作为 F 级适配器），但把它当作**相机能力探测工具**（`--list-camera-sizes`）很有价值——可作为「新输入源按实测重标定 gate 阈值」时的快速探测手段。若未来要做**视频/多视角连续采集**，scrcpy `--record`（MP4）可作为备选。
+
+### A.1 为什么探索它
+主路径手机相机经 spyglass（HTTP GET/POST）+ ADB 隧道拉帧。但 spyglass 对**相机枚举**能力弱（不暴露逐镜头合法尺寸清单），且我们此前网格实验只能靠「逐 id 试 config + 看输出」摸索。scrcpy 用 CameraX 的 Camera2 完整接口枚举，能一次性列出全部信息，正好补上这块盲区。
+
+### A.2 实测环境
+- scrcpy `4.1`（WinGet 安装，`Genymobile.scrcpy`），SDL 3.4.12 / libavcodec 62.28.102。
+- 设备：`NABDU20512011233`（HUAWEI ANA-AN00，Android 12，USB 连接）。
+
+### A.3 关键能力（help 相关选项）
+
+| 选项 | 作用 | 备注 |
+|---|---|---|
+| `--list-cameras` | 列出设备相机（id / facing / 最大尺寸 / fps / zoom 范围） | **互补 spyglass 的最大价值点** |
+| `--list-camera-sizes` | 列出每个相机的合法尺寸清单 | 同镜头全分辨率，便于选档 |
+| `--camera-id=id` | 指定相机 id（配 `--video-source=camera`） | |
+| `--camera-fps=value` | 指定采集帧率 | 可选值见 `--list-cameras` 的 `fps={...}` |
+| `--camera-size=WxH` | 指定明确采集尺寸 | 必须是 `--list-camera-sizes` 的合法项 |
+| `--camera-facing=facing` | 按方向选（front/back/...） | |
+| `--camera-ar=value` | 按宽高比选（`sensor` 或比例） | ±10% 容忍 |
+| `--camera-zoom=value` / `--camera-torch` | 变焦初值 / 开补光灯 | |
+| `--camera-high-speed` | 高速采集模式 | 需设备/镜头支持 |
+| `--video-source=source` | `display` 或 `camera` | **camera mirroring 需 Android 12+** |
+| `--record=file.mp4` | 录像到文件（配 `--record-format`） | 当前无「单帧抓取」接口 |
+| `-r` 别名 | 同上 | |
+
+### A.4 实机相机清单（`--list-cameras`，HUAWEI ANA-AN00）
+
+```
+--camera-id=0    (back, 8192x6144, fps={15,20,24,25,30,60}, zoom-range=[1,10])
+--camera-id=1    (front, 6528x4896, fps={15,20,24,25,30,60}, zoom-range=[1,6])
+--camera-id=2    (back, 8192x6144, fps={15,20,24,25,30}, zoom-range=[1,10])
+--camera-id=3    (front, 6528x4896, fps={15,20,24,25,30,60}, zoom-range=[1,6])
+--camera-id=4    (back, 4608x3456, fps={15,20,24,25,30}, zoom-range=[1,10])
+--camera-id=6    (back, 3264x2448, fps={15,20,24,25,30}, zoom-range=[1,10])
+```
+
+**与 spyglass 网格实验对比**：两者都枚举出 6 个逻辑相机，但 `id` 映射不同（scrcpy 用 `0/1/2/3/4/6`，spyglass 报 `0..5`）。**两个工具暴露的相机集合不一致**——不同 app 走不同 CameraX/Camera2 组合，导致逻辑 id 错位。**结论：相机 id 不能跨工具复用**；要采集某镜头，必须在所用工具内部按其枚举结果选。
+
+### A.5 实机合法分辨率（`--camera-id=6` back 3264x2448 的完整清单）
+
+```
+4096x3072, 4096x2304, 4096x1888, 3648x2056, 3648x1680, 3648x2056,
+3072x3072, 3840x2160, 3840x1760, 3840x1648, 3120x2340, 2560x1080,
+3280x2448, 3264x2448, 3264x1840, 3008x2256, 2448x2448, 2336x1080,
+2048x1536, 1920x1080, 1552x720, 1440x1080, 1456x1456, 1664x768,
+1440x720, 1280x960, 1280x720, 1088x1080, 960x720, 960x540,
+720x720, 720x540, 640x480
+```
+
+**印证此前结论**：包含 `3072x3072`、`2448x2448`、`1456x1456` 等**方形档**（CameraX 就近映射成方形），也保留 `3264x2448`（视频流默认 4:3）。**注意 `3072x4096`（我们 push 的 3:4 竖屏档）不在其列**——scrcpy 走 CameraX 会映射到 `3072x3072`；这与 spyglass 把 `3264x2448` 映射成 `3072x3072` 的行为一致（**竖屏 3:4 高分档偏不被 CameraX 保真**）。若确实要竖屏 3:4，需自研 App 走 Camera2 `TakePicture`（已在 spec 立项，未并入主流程）。
+
+### A.6 对管线的影响与后续定位
+
+- **不作为采集后端**：spyglass 的 `GET /snap` 单帧抓取 + `POST /config` 动态配置，仍是最贴合「静态图采集台」的后端；scrcpy 无对应单帧接口。
+- **作为能力探测工具**：接新机型时，先用 `scrcpy --list-camera-sizes` 一次性拿到「合法尺寸清单 + 最高分辨率 + fps」，据此定 `--camera-id`/`--camera-size` 与 gate 阈值，比逐档试 spyglass config 高效。
+- **VideoSource 前瞻**：`capture.json` 若未来扩展 `camera.transit` 或新增 `burst/video` 采集，scrcpy `--record` 可产出 MP4 作为连续采样源；届时需在 `_do_capture` 之外新增「从 MP4 抽帧」路径。
+- **前提约束**：camera mirroring 需 **Android 12+**（本机 OK）。若面向低版本机型，scrcpy 不可用，仍需 spyglass。
+- **跨相机 id 不可复用**（见 A.4），接多机时应**以各工具内部枚举为准**，勿假设 `cam0` 恒为主摄。
+
+### A.7 一句话给后续开发者
+> 想快速知道某台手机相机有哪些镜头/能开多大分辨率 → 用 `scrcpy --list-cameras` / `--list-camera-sizes`；想按需抓单帧走 `spyglass`（`GET /snap`）。两者相机 id 映射不同，不能混用。

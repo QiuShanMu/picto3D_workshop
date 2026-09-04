@@ -15,5 +15,6 @@ data/
 !fixtures/**/*.glb
 .p3d/
 experiments/
+archify-out/
 .DS_Store
 Thumbs.db
