@@ -76,6 +76,24 @@ def _long_edge_resize(bgr: np.ndarray, edge: int) -> np.ndarray:
     return cv2.resize(bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LANCZOS4)
 
 
+def _apply_rotate(bgr: np.ndarray, rot_deg: int) -> np.ndarray:
+    """Rotate a BGR frame by a multiple of 90 degrees (0/90/180/270).
+
+    Normalizes any int to {0,90,180,270}; used both for the capture preview and
+    the persisted color/ frame so that what the operator sees matches the file.
+    """
+    r = int(rot_deg) % 360
+    if r < 0:
+        r += 360
+    if r == 90:
+        return cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
+    if r == 180:
+        return cv2.rotate(bgr, cv2.ROTATE_180)
+    if r == 270:
+        return cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return bgr
+
+
 def _atomic_write_bgr(path: Path, bgr: np.ndarray, quality: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")

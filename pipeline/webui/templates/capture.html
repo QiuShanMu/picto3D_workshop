@@ -23,12 +23,16 @@
   .lightbox .nav{position:absolute;top:50%;transform:translateY(-50%);color:#fff;font-size:2.4rem;cursor:pointer;padding:0 12px;user-select:none;opacity:.8}
   .lightbox .nav:hover{opacity:1}
   .lightbox .prev{left:8px}.lightbox .next{right:8px}
+  .rot{position:absolute;top:12px;right:12px;background:rgba(0,0,0,.55);color:#fff;border:1px solid rgba(255,255,255,.25);border-radius:8px;padding:4px 10px;font-size:.74rem;cursor:pointer;backdrop-filter:blur(4px);z-index:5}
+  .rot:hover{background:rgba(0,0,0,.75)}
+  #live{transition:transform .2s ease}
 </style>
 <div class="body">
   <div class="capwrap">
     <div class="preview">
       <img id="live" src="/stream" alt="实时预览">
       <span class="badge">D435I · <span id="serial">…</span> · <span id="res">…</span></span>
+      <button class="rot" id="rotBtn" title="旋转画面（90° 粒度）" type="button">↻ <span id="rotDeg">0°</span></button>
       <div class="gate">
         <span>清晰度<b id="gSharp">–</b></span>
         <span>明暗剪切<b id="gExp">–</b></span>
@@ -537,12 +541,28 @@ document.addEventListener('keydown', (e)=>{
 });
 
 // ---- ② 视角采集 ----
+// 画面旋转（90° 粒度）：预览 CSS 旋转 + 采集时把角度落盘
+let currentRotate = 0;
+function applyRotateUI(){
+  const deg = currentRotate % 360;
+  $('live').style.transform = deg ? `rotate(${deg}deg)` : '';
+  $('rotDeg').textContent = deg + '°';
+}
+$('rotBtn').onclick = () => {
+  currentRotate = (currentRotate + 90) % 360;
+  applyRotateUI();
+  const q = $('gRatio')?.textContent || '';
+  // 旋转后预览/拍摄的朝向说明
+  setStatus(`画面旋转 ${currentRotate % 360}°（采集将按此角度落盘）`, '');
+};
+applyRotateUI();
+
 $('shoot').onclick=async()=>{
   const skuVal=($('skuLocked').value||$('sku').value).trim();
   if(!skuVal){setStatus('请先扫码或输入并锁定 SKU','err');return;}
   $('shoot').disabled=true; $('spin').classList.add('show'); setStatus('正在采集并评估门闩…','');
   try{
-    const r=await fetch('/capture',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({batch:$('batch').value,sku:skuVal,index:cur})});
+    const r=await fetch('/capture',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({batch:$('batch').value,sku:skuVal,index:cur,rotate:currentRotate})});
     const j=await r.json();
     if(j.ok){
       $('gSharp').textContent=j.gate.sharpness.toFixed(1);

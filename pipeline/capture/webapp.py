@@ -27,7 +27,7 @@ from pipeline.capture.camera import ColorControls
 from pipeline.capture.device import make_capture_device
 from pipeline.capture.device_base import CaptureDevice, DeviceCapabilities
 from pipeline.capture.gate import gate_frame
-from pipeline.capture.run import _atomic_write_bgr, _load_shading_lut, _long_edge_resize, OUTPUT_EDGE, JPEG_QUALITY, SHADING_DIR
+from pipeline.capture.run import _atomic_write_bgr, _apply_rotate, _load_shading_lut, _long_edge_resize, OUTPUT_EDGE, JPEG_QUALITY, SHADING_DIR
 from pipeline.capture.shading import calibrate_shading
 
 DEFAULT_CAPTURE_ROOT = "data/captures"
@@ -478,7 +478,9 @@ class CameraWorker:
         color_dir.mkdir(parents=True, exist_ok=True)
 
         saved_color = self.lut.apply(raw_bgr) if self.lut is not None else raw_bgr
-        resized = _long_edge_resize(saved_color, OUTPUT_EDGE)
+        rotate = int(req.get("rotate", 0) or 0)
+        rotated = _apply_rotate(saved_color, rotate)
+        resized = _long_edge_resize(rotated, OUTPUT_EDGE)
         frame_name = f"{index}_yaw{yaw:03d}"
         color_file = f"{frame_name}.jpg"
         _atomic_write_bgr(color_dir / color_file, resized, JPEG_QUALITY)
@@ -512,6 +514,7 @@ class CameraWorker:
         existing = next((f for f in frames if f.get("index") == index), None)
         frame_entry = {
             "index": index, "yaw_deg": yaw, "pose": "yaw",
+            "rotate": rotate,
             "hunyuan": _hunyuan_field(index),
             "color": f"color/{color_file}", "depth": None,
             "gate": gate_data,
